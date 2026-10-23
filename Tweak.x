@@ -179,6 +179,8 @@ static NSInteger const kMaxHistoryItems = 50;
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell" forIndexPath:indexPath];
+    cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"cell"];
+
     NSDictionary *item = self.items[indexPath.row];
     NSString *text = item[@"text"] ?: @"";
 
@@ -350,10 +352,7 @@ static void CMAddKeyboardButton(void) {
     cmKeyboardButton.backgroundColor = [[UIColor systemGray5Color] colorWithAlphaComponent:0.9];
     cmKeyboardButton.layer.cornerRadius = 8;
     cmKeyboardButton.clipsToBounds = YES;
-    cmKeyboardButton.frame = CGRectMake(0, 0, 36, 36);
-    [cmKeyboardButton addTarget:nil action:nil forControlEvents:UIControlEventTouchUpInside];
 
-    // Use a block via associated object or simple target
     [cmKeyboardButton addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
         CMPresentHistory();
     }] forControlEvents:UIControlEventTouchUpInside];
@@ -362,7 +361,7 @@ static void CMAddKeyboardButton(void) {
     CGFloat kbWidth = keyboardWindow.bounds.size.width;
     CGFloat kbHeight = keyboardWindow.bounds.size.height;
     CGFloat margin = 8;
-    cmKeyboardButton.frame = CGRectMake(kbWidth - 36 - margin - 40, // leave space for language key
+    cmKeyboardButton.frame = CGRectMake(kbWidth - 36 - margin - 40,
                                         kbHeight - 36 - margin - 10,
                                         36, 36);
 
@@ -391,7 +390,7 @@ static void CMRemoveKeyboardButton(void) {
     %orig;
     // Extract first string if available
     for (NSDictionary *item in items) {
-        id str = item[(id)kUTTypeUTF8PlainText] ?: item[@"public.utf8-plain-text"] ?: item[@"public.plain-text"];
+        id str = item[@"public.utf8-plain-text"] ?: item[@"public.plain-text"] ?: item[@"public.text"];
         if ([str isKindOfClass:[NSString class]] && [(NSString *)str length] > 0) {
             [[CMHistoryManager shared] addText:(NSString *)str];
             break;
