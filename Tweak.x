@@ -6,10 +6,28 @@
 static NSString * const kHistoryPath = @"/var/mobile/Library/CopyMody/history.plist";
 static NSInteger const kMaxHistoryItems = 50;
 
+// ==================== Helpers ====================
+static NSArray<UIWindow *> *CMAllWindows(void) {
+    NSMutableArray<UIWindow *> *result = [NSMutableArray array];
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            [result addObjectsFromArray:((UIWindowScene *)scene).windows];
+        }
+    }
+    return result;
+}
+
+static UIWindow *CMKeyWindow(void) {
+    for (UIWindow *w in CMAllWindows()) {
+        if (w.isKeyWindow) return w;
+    }
+    return CMAllWindows().firstObject;
+}
+
 // ==================== History Manager ====================
 @interface CMHistoryManager : NSObject
 + (instancetype)shared;
-- (NSArray<NSDictionary *> *)allItems;          // newest first
+- (NSArray<NSDictionary *> *)allItems;
 - (void)addText:(NSString *)text;
 - (void)removeItemAtIndex:(NSInteger)index;
 - (void)clearAll;
@@ -32,7 +50,6 @@ static NSInteger const kMaxHistoryItems = 50;
 - (instancetype)init {
     self = [super init];
     if (self) {
-        // Ensure directory exists
         NSString *dir = [kHistoryPath stringByDeletingLastPathComponent];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES
@@ -52,7 +69,6 @@ static NSInteger const kMaxHistoryItems = 50;
 - (void)addText:(NSString *)text {
     if (!text || text.length == 0) return;
 
-    // Avoid consecutive duplicates
     if (_items.count > 0) {
         NSString *last = _items.firstObject[@"text"];
         if ([last isEqualToString:text]) return;
@@ -65,7 +81,6 @@ static NSInteger const kMaxHistoryItems = 50;
 
     [_items insertObject:entry atIndex:0];
 
-    // Limit size
     while (_items.count > kMaxHistoryItems) {
         [_items removeLastObject];
     }
@@ -104,7 +119,6 @@ static NSInteger const kMaxHistoryItems = 50;
 
     self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
 
-    // Card container
     UIView *card = [[UIView alloc] init];
     card.backgroundColor = [UIColor systemBackgroundColor];
     card.layer.cornerRadius = 16;
@@ -112,7 +126,6 @@ static NSInteger const kMaxHistoryItems = 50;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:card];
 
-    // Header
     UILabel *titleLabel = [[UILabel alloc] init];
     titleLabel.text = @"CopyMody";
     titleLabel.font = [UIFont boldSystemFontOfSize:18];
@@ -142,7 +155,6 @@ static NSInteger const kMaxHistoryItems = 50;
     [self.tableView registerClass:[UITableViewCell class] forCellReuseIdentifier:@"cell"];
     [card addSubview:self.tableView];
 
-    // Constraints
     [NSLayoutConstraint activateConstraints:@[
         [card.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
         [card.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
@@ -167,7 +179,6 @@ static NSInteger const kMaxHistoryItems = 50;
     self.items = [[CMHistoryManager shared] allItems];
     [self.tableView reloadData];
 
-    // Tap outside to dismiss
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(closeTapped)];
     tap.cancelsTouchesInView = NO;
     [self.view addGestureRecognizer:tap];
@@ -178,8 +189,7 @@ static NSInteger const kMaxHistoryItems = 50;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell" forIndexPath:indexPath];
-    cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"cell"];
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"cell"];
 
     NSDictionary *item = self.items[indexPath.row];
     NSString *text = item[@"text"] ?: @"";
@@ -188,7 +198,6 @@ static NSInteger const kMaxHistoryItems = 50;
     cell.textLabel.font = [UIFont systemFontOfSize:15];
     cell.textLabel.text = text;
 
-    // Timestamp subtitle
     NSTimeInterval ts = [item[@"timestamp"] doubleValue];
     NSDate *date = [NSDate dateWithTimeIntervalSince1970:ts];
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
@@ -207,33 +216,17 @@ static NSInteger const kMaxHistoryItems = 50;
     NSString *text = item[@"text"];
     if (!text) return;
 
-    // Put into pasteboard
     [[UIPasteboard generalPasteboard] setString:text];
 
-    // Try to paste into the current first responder
-    UIWindow *keyWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive &&
-            [scene isKindOfClass:[UIWindowScene class]]) {
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                if (w.isKeyWindow) { keyWindow = w; break; }
-            }
-        }
-    }
-    if (!keyWindow) keyWindow = [UIApplication sharedApplication].windows.firstObject;
-
+    UIWindow *keyWindow = CMKeyWindow();
     UIView *firstResponder = [self findFirstResponder:keyWindow];
+
     if ([firstResponder respondsToSelector:@selector(paste:)]) {
         [firstResponder paste:nil];
-    } else {
-        // Fallback: insert text if possible
-        if ([firstResponder isKindOfClass:[UITextField class]]) {
-            UITextField *tf = (UITextField *)firstResponder;
-            [tf insertText:text];
-        } else if ([firstResponder isKindOfClass:[UITextView class]]) {
-            UITextView *tv = (UITextView *)firstResponder;
-            [tv insertText:text];
-        }
+    } else if ([firstResponder isKindOfClass:[UITextField class]]) {
+        [(UITextField *)firstResponder insertText:text];
+    } else if ([firstResponder isKindOfClass:[UITextView class]]) {
+        [(UITextView *)firstResponder insertText:text];
     }
 
     [self closeTapped];
@@ -281,6 +274,7 @@ static NSInteger const kMaxHistoryItems = 50;
 }
 
 - (UIView *)findFirstResponder:(UIView *)view {
+    if (!view) return nil;
     if (view.isFirstResponder) return view;
     for (UIView *sub in view.subviews) {
         UIView *found = [self findFirstResponder:sub];
@@ -296,7 +290,7 @@ static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmKeyboardButton = nil;
 
 static void CMPresentHistory(void) {
-    if (cmOverlayWindow) return; // already showing
+    if (cmOverlayWindow) return;
 
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -323,18 +317,18 @@ static void CMPresentHistory(void) {
 }
 
 static void CMAddKeyboardButton(void) {
-    // Find the keyboard window
     UIWindow *keyboardWindow = nil;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+
+    for (UIWindow *w in CMAllWindows()) {
         NSString *name = NSStringFromClass(w.class);
         if ([name containsString:@"Keyboard"] || [name containsString:@"UIRemoteKeyboard"]) {
             keyboardWindow = w;
             break;
         }
     }
-    // iOS 13+ often uses UITextEffectsWindow / UIRemoteKeyboardWindow
+
     if (!keyboardWindow) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        for (UIWindow *w in CMAllWindows()) {
             if (w.windowLevel > UIWindowLevelNormal + 1) {
                 keyboardWindow = w;
                 break;
@@ -343,7 +337,6 @@ static void CMAddKeyboardButton(void) {
     }
     if (!keyboardWindow) return;
 
-    // Avoid duplicates
     if (cmKeyboardButton && cmKeyboardButton.superview) return;
 
     cmKeyboardButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -357,7 +350,6 @@ static void CMAddKeyboardButton(void) {
         CMPresentHistory();
     }] forControlEvents:UIControlEventTouchUpInside];
 
-    // Position bottom-right (opposite language key area)
     CGFloat kbWidth = keyboardWindow.bounds.size.width;
     CGFloat kbHeight = keyboardWindow.bounds.size.height;
     CGFloat margin = 8;
@@ -388,7 +380,6 @@ static void CMRemoveKeyboardButton(void) {
 
 - (void)setItems:(NSArray *)items {
     %orig;
-    // Extract first string if available
     for (NSDictionary *item in items) {
         id str = item[@"public.utf8-plain-text"] ?: item[@"public.plain-text"] ?: item[@"public.text"];
         if ([str isKindOfClass:[NSString class]] && [(NSString *)str length] > 0) {
@@ -407,7 +398,6 @@ static void CMRemoveKeyboardButton(void) {
 
 %end
 
-// Observe keyboard show/hide
 %hook UIKeyboardImpl
 
 - (void)showKeyboard {
@@ -420,7 +410,6 @@ static void CMRemoveKeyboardButton(void) {
 %end
 
 %ctor {
-    // Also listen to notifications as fallback
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
