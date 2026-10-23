@@ -285,9 +285,10 @@ static UIWindow *CMKeyWindow(void) {
 
 @end
 
-// ==================== Keyboard Button + Presenter ====================
+// ==================== Floating Button + History Presenter ====================
 static UIWindow *cmOverlayWindow = nil;
-static UIButton *cmKeyboardButton = nil;
+static UIButton *cmFloatButton = nil;
+static UIWindow *cmButtonHostWindow = nil;
 
 static void CMPresentHistory(void) {
     if (cmOverlayWindow) return;
@@ -316,55 +317,59 @@ static void CMPresentHistory(void) {
     cmOverlayWindow.hidden = NO;
 }
 
-static void CMAddKeyboardButton(void) {
-    UIWindow *keyboardWindow = nil;
+static void CMShowFloatButton(CGRect keyboardFrame) {
+    UIWindow *keyWindow = CMKeyWindow();
+    if (!keyWindow) return;
 
-    for (UIWindow *w in CMAllWindows()) {
-        NSString *name = NSStringFromClass(w.class);
-        if ([name containsString:@"Keyboard"] || [name containsString:@"UIRemoteKeyboard"]) {
-            keyboardWindow = w;
-            break;
-        }
+    // Remove previous button if any
+    if (cmFloatButton) {
+        [cmFloatButton removeFromSuperview];
+        cmFloatButton = nil;
     }
 
-    if (!keyboardWindow) {
-        for (UIWindow *w in CMAllWindows()) {
-            if (w.windowLevel > UIWindowLevelNormal + 1) {
-                keyboardWindow = w;
-                break;
-            }
-        }
+    CGFloat btnSize = 40.0;
+    CGFloat margin = 10.0;
+
+    // Position: bottom-right, just above the keyboard
+    // keyboardFrame is in screen coordinates
+    CGFloat x = keyWindow.bounds.size.width - btnSize - margin - 6;
+    CGFloat y = keyboardFrame.origin.y - btnSize - margin;
+
+    // Safety: if keyboard frame is zero or invalid, place near bottom
+    if (keyboardFrame.size.height < 10 || y < 40) {
+        y = keyWindow.bounds.size.height - 320 - btnSize;
     }
-    if (!keyboardWindow) return;
 
-    if (cmKeyboardButton && cmKeyboardButton.superview) return;
+    cmFloatButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    cmFloatButton.frame = CGRectMake(x, y, btnSize, btnSize);
+    cmFloatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.45 blue:0.95 alpha:0.95];
+    cmFloatButton.layer.cornerRadius = btnSize / 2.0;
+    cmFloatButton.layer.shadowColor = [UIColor blackColor].CGColor;
+    cmFloatButton.layer.shadowOpacity = 0.3;
+    cmFloatButton.layer.shadowOffset = CGSizeMake(0, 2);
+    cmFloatButton.layer.shadowRadius = 4;
+    cmFloatButton.clipsToBounds = NO;
 
-    cmKeyboardButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [cmKeyboardButton setTitle:@"📋" forState:UIControlStateNormal];
-    cmKeyboardButton.titleLabel.font = [UIFont systemFontOfSize:22];
-    cmKeyboardButton.backgroundColor = [[UIColor systemGray5Color] colorWithAlphaComponent:0.9];
-    cmKeyboardButton.layer.cornerRadius = 8;
-    cmKeyboardButton.clipsToBounds = YES;
+    [cmFloatButton setTitle:@"📋" forState:UIControlStateNormal];
+    cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:20];
 
-    [cmKeyboardButton addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
         CMPresentHistory();
     }] forControlEvents:UIControlEventTouchUpInside];
 
-    CGFloat kbWidth = keyboardWindow.bounds.size.width;
-    CGFloat kbHeight = keyboardWindow.bounds.size.height;
-    CGFloat margin = 8;
-    cmKeyboardButton.frame = CGRectMake(kbWidth - 36 - margin - 40,
-                                        kbHeight - 36 - margin - 10,
-                                        36, 36);
+    // Keep it above most content but below alerts
+    cmFloatButton.layer.zPosition = 9999;
 
-    [keyboardWindow addSubview:cmKeyboardButton];
+    [keyWindow addSubview:cmFloatButton];
+    cmButtonHostWindow = keyWindow;
 }
 
-static void CMRemoveKeyboardButton(void) {
-    if (cmKeyboardButton) {
-        [cmKeyboardButton removeFromSuperview];
-        cmKeyboardButton = nil;
+static void CMHideFloatButton(void) {
+    if (cmFloatButton) {
+        [cmFloatButton removeFromSuperview];
+        cmFloatButton = nil;
     }
+    cmButtonHostWindow = nil;
 }
 
 // ==================== Hooks ====================
@@ -398,31 +403,52 @@ static void CMRemoveKeyboardButton(void) {
 
 %end
 
-%hook UIKeyboardImpl
-
-- (void)showKeyboard {
-    %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        CMAddKeyboardButton();
-    });
-}
-
-%end
-
 %ctor {
+    // Show button when keyboard appears – use frame from notification (most reliable)
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillShowNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        NSDictionary *info = note.userInfo;
+        CGRect kbFrame = [info[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+
+        // Convert to key window coordinates if needed
+        UIWindow *keyWindow = CMKeyWindow();
+        if (keyWindow) {
+            kbFrame = [keyWindow convertRect:kbFrame fromWindow:nil];
+        }
+
+        CMShowFloatButton(kbFrame);
+    }];
+
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
-        CMAddKeyboardButton();
+                                                  usingBlock:^(NSNotification *note) {
+        NSDictionary *info = note.userInfo;
+        CGRect kbFrame = [info[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+
+        UIWindow *keyWindow = CMKeyWindow();
+        if (keyWindow) {
+            kbFrame = [keyWindow convertRect:kbFrame fromWindow:nil];
+        }
+
+        CMShowFloatButton(kbFrame);
     }];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(__unused NSNotification *note) {
-        CMRemoveKeyboardButton();
+        CMHideFloatButton();
     }];
 
-    NSLog(@"[CopyMody] Loaded – monitoring clipboard + keyboard button ready");
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *note) {
+        CMHideFloatButton();
+    }];
+
+    NSLog(@"[CopyMody] Loaded – floating button + clipboard monitor ready");
 }
