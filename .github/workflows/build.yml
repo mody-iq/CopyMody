@@ -13,20 +13,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Theos
+      - name: Set up RootHide Theos
         run: |
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          git clone --recursive https://github.com/roothide/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Install dependencies
         run: |
           brew install ldid
-          # Additional tools if needed for RootHide scheme
+
+      - name: Install iOS SDK
+        run: |
+          export THEOS=$HOME/theos
+          mkdir -p $THEOS/sdks
+          # Download a recent SDK if not present
+          if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ]; then
+            curl -L https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
+            tar -xf /tmp/sdk.tar.xz -C $THEOS/sdks
+            rm /tmp/sdk.tar.xz
+          fi
 
       - name: Build package
         run: |
           export THEOS=$HOME/theos
-          make package
+          make package FINALPACKAGE=1
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
