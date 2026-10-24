@@ -15,6 +15,7 @@ static BOOL cmIsSaving = NO;
 static NSTimeInterval cmLastCapture = 0;
 static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
+static BOOL cmPresenting = NO;
 
 static NSArray<UIWindow *> *CMAllWindows(void) {
     NSMutableArray *result = [NSMutableArray array];
@@ -37,7 +38,6 @@ static UIWindow *CMKeyWindow(void) {
 static UIWindowScene *CMActiveScene(void) {
     UIWindow *kw = CMKeyWindow();
     if (kw.windowScene) return kw.windowScene;
-
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if (![s isKindOfClass:[UIWindowScene class]]) continue;
         if (s.activationState == UISceneActivationStateForegroundActive)
@@ -116,11 +116,9 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     NSString *jb2 = jbroot(logical2);
     if (!jb1.length) jb1 = logical1;
     if (!jb2.length) jb2 = logical2;
-
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *p in @[jb1, logical1, jb2, logical2]) {
-        NSString *dir = [p stringByDeletingLastPathComponent];
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [fm createDirectoryAtPath:p.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
     }
     return @[jb1, logical1, jb2, logical2];
 }
@@ -131,6 +129,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 - (void)addText:(NSString *)text;
 - (void)removeItemAtIndex:(NSInteger)index;
 - (void)clearAll;
+- (void)cm_openPanel;
 @end
 
 @implementation CMHistoryManager {
@@ -178,9 +177,8 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     dispatch_async(_ioQueue, ^{
         NSData *data = [NSJSONSerialization dataWithJSONObject:snap options:0 error:nil];
         if (data) {
-            for (NSString *path in CMHistoryPaths()) {
+            for (NSString *path in CMHistoryPaths())
                 [data writeToFile:path atomically:YES];
-            }
         }
         [defs setObject:snap forKey:kHistoryKey];
         [defs synchronize];
@@ -207,11 +205,9 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [self loadFromDisk];
     if (_items.count > 0 && [_items.firstObject[@"text"] isEqualToString:t]) return;
 
-    NSDictionary *entry = @{ @"text": t, @"timestamp": @((NSInteger)now) };
-    [_items insertObject:entry atIndex:0];
+    [_items insertObject:@{ @"text": t, @"timestamp": @((NSInteger)now) } atIndex:0];
     while ((NSInteger)_items.count > kMaxHistoryItems) [_items removeLastObject];
     [self persist];
-    NSLog(@"[CopyMody] saved (%lu)", (unsigned long)_items.count);
 }
 
 - (void)removeItemAtIndex:(NSInteger)index {
@@ -239,22 +235,15 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
-
-    // Tap outside card to close
-    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(close)];
-    [self.view addGestureRecognizer:bgTap];
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
 
     UIView *card = [[UIView alloc] init];
+    card.tag = 99001;
     card.backgroundColor = [UIColor systemBackgroundColor];
     card.layer.cornerRadius = 16;
     card.clipsToBounds = YES;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:card];
-
-    // Prevent bg tap from closing when tapping card
-    UITapGestureRecognizer *cardTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:nil];
-    [card addGestureRecognizer:cardTap];
 
     UILabel *title = [[UILabel alloc] init];
     title.text = @"CopyMody";
@@ -310,17 +299,27 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         [self.emptyLabel.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor]
     ]];
 
+    // Close only when tapping dimmed area (not the card)
+    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bgTapped:)];
+    [self.view addGestureRecognizer:bgTap];
+
     [self reload];
 
-    // Deferred: try selection only (no pasteboard.string — avoids freeze / broken button)
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *sel = CMCaptureSelectionNow();
         if (sel.length > 0) {
             [[CMHistoryManager shared] addText:sel];
             [weakSelf reload];
         }
     });
+}
+
+- (void)bgTapped:(UITapGestureRecognizer *)gr {
+    CGPoint p = [gr locationInView:self.view];
+    UIView *card = [self.view viewWithTag:99001];
+    if (card && CGRectContainsPoint(card.frame, p)) return;
+    [self close];
 }
 
 - (void)reload {
@@ -392,29 +391,27 @@ static void CMRemoveButtons(void) {
             if (v.tag == kButtonTag) [v removeFromSuperview];
         }
     }
-    cmFloatButton = nil;
+    if (cmFloatButton) {
+        [cmFloatButton removeFromSuperview];
+        cmFloatButton = nil;
+    }
 }
 
 static void CMPresentHistory(void) {
-    // If already open, close it (toggle)
-    if (cmOverlayWindow) {
-        cmOverlayWindow.hidden = YES;
-        cmOverlayWindow.rootViewController = nil;
-        cmOverlayWindow = nil;
-        return;
-    }
+    if (cmPresenting) return;
+    if (cmOverlayWindow) return; // already open — do not toggle-close
+
+    cmPresenting = YES;
 
     UIWindowScene *scene = CMActiveScene();
     if (!scene) {
-        NSLog(@"[CopyMody] no scene — cannot present");
+        cmPresenting = NO;
+        NSLog(@"[CopyMody] no scene");
         return;
     }
 
-    // Capture selection BEFORE overlay steals focus
     NSString *sel = CMCaptureSelectionNow();
-    if (sel.length > 0) {
-        [[CMHistoryManager shared] addText:sel];
-    }
+    if (sel.length > 0) [[CMHistoryManager shared] addText:sel];
 
     cmOverlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
     cmOverlayWindow.windowLevel = UIWindowLevelAlert + 100;
@@ -426,22 +423,48 @@ static void CMPresentHistory(void) {
         cmOverlayWindow.hidden = YES;
         cmOverlayWindow.rootViewController = nil;
         cmOverlayWindow = nil;
+        cmPresenting = NO;
     };
     cmOverlayWindow.rootViewController = vc;
-    cmOverlayWindow.hidden = NO;
     [cmOverlayWindow makeKeyAndVisible];
 
-    NSLog(@"[CopyMody] panel presented");
+    // Release presenting lock shortly after show
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        cmPresenting = NO;
+    });
+
+    NSLog(@"[CopyMody] panel shown");
 }
+
+@implementation CMHistoryManager (Button)
+- (void)cm_openPanel {
+    CMPresentHistory();
+}
+@end
 
 static void CMShowButton(CGRect kb) {
     UIWindow *kw = CMKeyWindow();
     if (!kw) return;
+
+    // If a valid button already exists on this key window, just update frame
+    if (cmFloatButton && cmFloatButton.superview == kw) {
+        CGFloat s = 40, pad = 8;
+        CGFloat x = kb.origin.x + kb.size.width - s - pad;
+        CGFloat y = kb.origin.y - s - 8;
+        if (kb.size.height < 50 || y < 40) {
+            x = kw.bounds.size.width - s - 12;
+            y = kw.bounds.size.height - 120;
+        }
+        cmFloatButton.frame = CGRectMake(x, y, s, s);
+        [kw bringSubviewToFront:cmFloatButton];
+        return;
+    }
+
     CMRemoveButtons();
 
     CGFloat s = 40, pad = 8;
     CGFloat x = kb.origin.x + kb.size.width - s - pad;
-    CGFloat y = kb.origin.y - s - 6; // ABOVE keyboard, not inside it
+    CGFloat y = kb.origin.y - s - 8;
     if (kb.size.height < 50 || y < 40) {
         x = kw.bounds.size.width - s - 12;
         y = kw.bounds.size.height - 120;
@@ -451,7 +474,7 @@ static void CMShowButton(CGRect kb) {
     cmFloatButton.tag = kButtonTag;
     cmFloatButton.frame = CGRectMake(x, y, s, s);
     cmFloatButton.backgroundColor = [UIColor colorWithRed:0.18 green:0.42 blue:0.92 alpha:1.0];
-    cmFloatButton.layer.cornerRadius = s / 2;
+    cmFloatButton.layer.cornerRadius = s / 2.0;
     cmFloatButton.layer.shadowOpacity = 0.35;
     cmFloatButton.layer.shadowRadius = 4;
     cmFloatButton.layer.shadowOffset = CGSizeMake(0, 2);
@@ -459,27 +482,14 @@ static void CMShowButton(CGRect kb) {
     [cmFloatButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     cmFloatButton.titleLabel.font = [UIFont boldSystemFontOfSize:13];
 
-    // Use target-action (more reliable than UIAction on older paths)
-    [cmFloatButton addTarget:[CMHistoryManager shared] action:@selector(cm_buttonTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    // Fallback: also use UIAction
-    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) {
-        CMPresentHistory();
-    }] forControlEvents:UIControlEventTouchUpInside];
+    // ONE handler only
+    [cmFloatButton addTarget:[CMHistoryManager shared]
+                      action:@selector(cm_openPanel)
+            forControlEvents:UIControlEventTouchUpInside];
 
     [kw addSubview:cmFloatButton];
     [kw bringSubviewToFront:cmFloatButton];
 }
-
-// Category so button target works
-@interface CMHistoryManager (Button)
-- (void)cm_buttonTapped;
-@end
-@implementation CMHistoryManager (Button)
-- (void)cm_buttonTapped {
-    CMPresentHistory();
-}
-@end
 
 %hook UIPasteboard
 - (void)setString:(NSString *)string {
@@ -537,9 +547,7 @@ static void CMShowButton(CGRect kb) {
 
 %ctor {
     int token = 0;
-    notify_register_dispatch(kDarwinName, &token, dispatch_get_main_queue(), ^(__unused int t) {
-        NSLog(@"[CopyMody] darwin notify");
-    });
+    notify_register_dispatch(kDarwinName, &token, dispatch_get_main_queue(), ^(__unused int t) {});
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         CGRect kb = [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
@@ -547,12 +555,11 @@ static void CMShowButton(CGRect kb) {
         if (kw) kb = [kw convertRect:kb fromWindow:nil];
         CMShowButton(kb);
     }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
-        CMRemoveButtons();
-    }];
+
+    // Do NOT remove button on WillHide if panel is open (avoids flicker)
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
-        CMRemoveButtons();
+        if (!cmOverlayWindow) CMRemoveButtons();
     }];
 
-    NSLog(@"[CopyMody] v0.1.9 loaded");
+    NSLog(@"[CopyMody] v0.1.10 loaded");
 }
