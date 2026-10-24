@@ -23,7 +23,7 @@ static NSString *cmPBClassName = @"?";
 static NSTimeInterval cmLastActive = 0;
 
 static NSString *CMDiagString(void) {
-    return [NSString stringWithFormat:@"v0.1.13 | h%ld n%ld c%ld | %@ | %@",
+    return [NSString stringWithFormat:@"v0.1.14 | h%ld n%ld c%ld | %@ | %@",
             (long)cmHookHits, (long)cmNotifHits, (long)cmCaptureCount, cmLastInfo, cmPBClassName];
 }
 
@@ -574,6 +574,82 @@ static void CMPresentHistory(void) {
 
 #pragma mark - Floating button
 
+static NSString * const kButtonPosKey = @"btnpos";
+static CGFloat const kButtonSize = 40;
+
+static CGPoint CMClampButtonCenter(CGPoint c, UIView *sv) {
+    CGFloat half = kButtonSize / 2.0;
+    CGFloat minY = sv.safeAreaInsets.top + half + 4;
+    CGFloat maxY = sv.bounds.size.height - half - 4;
+    if (cmKeyboardHeight > 40) {
+        maxY = sv.bounds.size.height - cmKeyboardHeight - half - 8;
+    }
+    if (maxY < minY) maxY = minY;
+    CGFloat minX = half + 4;
+    CGFloat maxX = sv.bounds.size.width - half - 4;
+    c.x = MIN(MAX(c.x, minX), maxX);
+    c.y = MIN(MAX(c.y, minY), maxY);
+    return c;
+}
+
+static void CMSaveButtonCenter(CGPoint c, UIView *sv) {
+    if (sv.bounds.size.width < 1 || sv.bounds.size.height < 1) return;
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kSuiteName];
+    [d setObject:@{ @"fx": @(c.x / sv.bounds.size.width),
+                    @"fy": @(c.y / sv.bounds.size.height) }
+          forKey:kButtonPosKey];
+}
+
+static BOOL CMLoadButtonCenter(UIView *sv, CGPoint *out) {
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kSuiteName];
+    NSDictionary *p = [d dictionaryForKey:kButtonPosKey];
+    if (![p isKindOfClass:[NSDictionary class]]) return NO;
+    NSNumber *fx = p[@"fx"];
+    NSNumber *fy = p[@"fy"];
+    if (![fx isKindOfClass:[NSNumber class]] || ![fy isKindOfClass:[NSNumber class]]) return NO;
+    *out = CGPointMake(fx.doubleValue * sv.bounds.size.width, fy.doubleValue * sv.bounds.size.height);
+    return YES;
+}
+
+@interface CMButtonPanTarget : NSObject
++ (instancetype)shared;
+- (void)pan:(UIPanGestureRecognizer *)gr;
+@end
+
+@implementation CMButtonPanTarget
+
++ (instancetype)shared {
+    static CMButtonPanTarget *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[CMButtonPanTarget alloc] init]; });
+    return s;
+}
+
+- (void)pan:(UIPanGestureRecognizer *)gr {
+    UIView *btn = gr.view;
+    UIView *sv = btn.superview;
+    if (!btn || !sv) return;
+
+    CGPoint t = [gr translationInView:sv];
+    [gr setTranslation:CGPointZero inView:sv];
+    CGPoint c = CGPointMake(btn.center.x + t.x, btn.center.y + t.y);
+    c = CMClampButtonCenter(c, sv);
+    btn.center = c;
+
+    if (gr.state == UIGestureRecognizerStateEnded || gr.state == UIGestureRecognizerStateCancelled) {
+        // Snap to the nearest side edge and remember the position
+        CGFloat margin = 12 + kButtonSize / 2.0;
+        CGFloat targetX = (c.x < sv.bounds.size.width / 2.0) ? margin : (sv.bounds.size.width - margin);
+        CGPoint target = CMClampButtonCenter(CGPointMake(targetX, c.y), sv);
+        [UIView animateWithDuration:0.2 animations:^{
+            btn.center = target;
+        }];
+        CMSaveButtonCenter(target, sv);
+    }
+}
+
+@end
+
 static void CMRemoveButtons(void) {
     for (UIWindow *w in CMAllWindows()) {
         for (UIView *v in [w.subviews copy]) {
@@ -589,19 +665,21 @@ static void CMShowButton(CGRect kb) {
 
     CMRemoveButtons();
 
-    CGFloat s = 40, pad = 8;
-    CGFloat x = kb.origin.x + kb.size.width - s - pad;
-    CGFloat y = kb.origin.y - s - 8;
-    if (kb.size.height < 50 || y < 40) {
-        x = kw.bounds.size.width - s - 12;
-        y = kw.bounds.size.height - 120;
+    // Default: right edge, well above the keyboard so it never covers keyboard keys or send buttons
+    CGPoint center;
+    if (!CMLoadButtonCenter(kw, &center)) {
+        CGFloat kbTop = kw.bounds.size.height - cmKeyboardHeight;
+        center = CGPointMake(kw.bounds.size.width - 12 - kButtonSize / 2.0, kbTop - 130);
     }
+    center = CMClampButtonCenter(center, kw);
 
     cmFloatButton = [UIButton buttonWithType:UIButtonTypeCustom];
     cmFloatButton.tag = kButtonTag;
-    cmFloatButton.frame = CGRectMake(x, y, s, s);
+    cmFloatButton.frame = CGRectMake(0, 0, kButtonSize, kButtonSize);
+    cmFloatButton.center = center;
+    cmFloatButton.alpha = 0.92;
     cmFloatButton.backgroundColor = [UIColor colorWithRed:0.18 green:0.42 blue:0.92 alpha:1.0];
-    cmFloatButton.layer.cornerRadius = s / 2.0;
+    cmFloatButton.layer.cornerRadius = kButtonSize / 2.0;
     cmFloatButton.layer.shadowOpacity = 0.35;
     cmFloatButton.layer.shadowRadius = 4;
     cmFloatButton.layer.shadowOffset = CGSizeMake(0, 2);
@@ -612,6 +690,10 @@ static void CMShowButton(CGRect kb) {
     [cmFloatButton addTarget:[CMHistoryManager shared]
                       action:@selector(cm_openPanel)
             forControlEvents:UIControlEventTouchUpInside];
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[CMButtonPanTarget shared]
+                                                                          action:@selector(pan:)];
+    [cmFloatButton addGestureRecognizer:pan];
 
     [kw addSubview:cmFloatButton];
     [kw bringSubviewToFront:cmFloatButton];
@@ -837,6 +919,6 @@ static void CMShowButton(CGRect kb) {
             if (!cmOverlayWindow) CMRemoveButtons();
         }];
 
-        NSLog(@"[CopyMody] v0.1.13 loaded");
+        NSLog(@"[CopyMody] v0.1.14 loaded");
     }
 }
