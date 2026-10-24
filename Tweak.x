@@ -13,6 +13,8 @@ static NSInteger const kButtonTag = 88442211;
 
 static BOOL cmIsSaving = NO;
 static NSTimeInterval cmLastCapture = 0;
+static UIWindow *cmOverlayWindow = nil;
+static UIButton *cmFloatButton = nil;
 
 static NSArray<UIWindow *> *CMAllWindows(void) {
     NSMutableArray *result = [NSMutableArray array];
@@ -28,7 +30,23 @@ static UIWindow *CMKeyWindow(void) {
     for (UIWindow *w in CMAllWindows()) {
         if (w.isKeyWindow) return w;
     }
-    return CMAllWindows().firstObject;
+    NSArray *wins = CMAllWindows();
+    return wins.count ? wins.firstObject : nil;
+}
+
+static UIWindowScene *CMActiveScene(void) {
+    UIWindow *kw = CMKeyWindow();
+    if (kw.windowScene) return kw.windowScene;
+
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        if (s.activationState == UISceneActivationStateForegroundActive)
+            return (UIWindowScene *)s;
+    }
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)s;
+    }
+    return nil;
 }
 
 static UIView *CMFindFirstResponder(UIView *view) {
@@ -55,7 +73,8 @@ static NSString *CMSelectedTextFromView(UIView *view) {
         UITextView *tv = (UITextView *)view;
         if (tv.selectedRange.length > 0 && tv.text.length > 0) {
             NSRange r = tv.selectedRange;
-            if (NSMaxRange(r) <= tv.text.length) return [tv.text substringWithRange:r];
+            if (NSMaxRange(r) <= tv.text.length)
+                return [tv.text substringWithRange:r];
         }
     }
     if ([view isKindOfClass:[UITextField class]]) {
@@ -90,16 +109,6 @@ static NSString *CMCaptureSelectionNow(void) {
     return nil;
 }
 
-static NSString *CMSafePasteboardString(void) {
-    UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    if (!pb.hasStrings) return nil;
-    @try {
-        NSString *s = pb.string;
-        if (s.length > 0) return s;
-    } @catch (__unused NSException *e) {}
-    return nil;
-}
-
 static NSArray<NSString *> *CMHistoryPaths(void) {
     NSString *logical1 = @"/var/mobile/Library/Preferences/com.mody.copymody.history.json";
     NSString *logical2 = @"/var/mobile/Library/CopyMody/history.json";
@@ -122,7 +131,6 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 - (void)addText:(NSString *)text;
 - (void)removeItemAtIndex:(NSInteger)index;
 - (void)clearAll;
-- (void)importFromPasteboardAndSelection;
 @end
 
 @implementation CMHistoryManager {
@@ -145,7 +153,6 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         _ioQueue = dispatch_queue_create("com.mody.copymody.io", DISPATCH_QUEUE_SERIAL);
         _items = [NSMutableArray array];
         [self loadFromDisk];
-        NSLog(@"[CopyMody] paths=%@", CMHistoryPaths());
     }
     return self;
 }
@@ -157,14 +164,12 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         if ([obj isKindOfClass:[NSArray class]] && [obj count] > 0) {
             _items = [obj mutableCopy];
-            NSLog(@"[CopyMody] loaded %lu from %@", (unsigned long)_items.count, path);
             return;
         }
     }
     NSArray *arr = [_defaults arrayForKey:kHistoryKey];
-    if ([arr isKindOfClass:[NSArray class]] && arr.count > 0) {
+    if ([arr isKindOfClass:[NSArray class]] && arr.count > 0)
         _items = [arr mutableCopy];
-    }
 }
 
 - (void)persist {
@@ -174,8 +179,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         NSData *data = [NSJSONSerialization dataWithJSONObject:snap options:0 error:nil];
         if (data) {
             for (NSString *path in CMHistoryPaths()) {
-                BOOL ok = [data writeToFile:path atomically:YES];
-                NSLog(@"[CopyMody] write %@ -> %@", ok ? @"OK" : @"FAIL", path);
+                [data writeToFile:path atomically:YES];
             }
         }
         [defs setObject:snap forKey:kHistoryKey];
@@ -196,7 +200,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     if (t.length > 8000) t = [t substringToIndex:8000];
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - cmLastCapture < 0.15 && _items.count > 0 &&
+    if (now - cmLastCapture < 0.2 && _items.count > 0 &&
         [_items.firstObject[@"text"] isEqualToString:t]) return;
     cmLastCapture = now;
 
@@ -207,16 +211,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [_items insertObject:entry atIndex:0];
     while ((NSInteger)_items.count > kMaxHistoryItems) [_items removeLastObject];
     [self persist];
-    NSLog(@"[CopyMody] + (%lu) %@", (unsigned long)_items.count,
-          [t substringToIndex:MIN((NSUInteger)40, t.length)]);
-}
-
-- (void)importFromPasteboardAndSelection {
-    NSString *sel = CMCaptureSelectionNow();
-    if (sel.length > 0) [self addText:sel];
-
-    NSString *pb = CMSafePasteboardString();
-    if (pb.length > 0) [self addText:pb];
+    NSLog(@"[CopyMody] saved (%lu)", (unsigned long)_items.count);
 }
 
 - (void)removeItemAtIndex:(NSInteger)index {
@@ -244,7 +239,11 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
+
+    // Tap outside card to close
+    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(close)];
+    [self.view addGestureRecognizer:bgTap];
 
     UIView *card = [[UIView alloc] init];
     card.backgroundColor = [UIColor systemBackgroundColor];
@@ -252,6 +251,10 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     card.clipsToBounds = YES;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:card];
+
+    // Prevent bg tap from closing when tapping card
+    UITapGestureRecognizer *cardTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:nil];
+    [card addGestureRecognizer:cardTap];
 
     UILabel *title = [[UILabel alloc] init];
     title.text = @"CopyMody";
@@ -280,7 +283,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [card addSubview:self.tableView];
 
     self.emptyLabel = [[UILabel alloc] init];
-    self.emptyLabel.text = @"لا يوجد عناصر\nانسخ نصاً ثم اضغط الزر";
+    self.emptyLabel.text = @"لا يوجد عناصر\nانسخ نصاً ثم افتح القائمة";
     self.emptyLabel.textAlignment = NSTextAlignmentCenter;
     self.emptyLabel.numberOfLines = 2;
     self.emptyLabel.textColor = [UIColor secondaryLabelColor];
@@ -308,6 +311,16 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     ]];
 
     [self reload];
+
+    // Deferred: try selection only (no pasteboard.string — avoids freeze / broken button)
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *sel = CMCaptureSelectionNow();
+        if (sel.length > 0) {
+            [[CMHistoryManager shared] addText:sel];
+            [weakSelf reload];
+        }
+    });
 }
 
 - (void)reload {
@@ -373,9 +386,6 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 
 @end
 
-static UIWindow *cmOverlayWindow = nil;
-static UIButton *cmFloatButton = nil;
-
 static void CMRemoveButtons(void) {
     for (UIWindow *w in CMAllWindows()) {
         for (UIView *v in [w.subviews copy]) {
@@ -386,22 +396,30 @@ static void CMRemoveButtons(void) {
 }
 
 static void CMPresentHistory(void) {
-    if (cmOverlayWindow) return;
-
-    [[CMHistoryManager shared] importFromPasteboardAndSelection];
-
-    UIWindowScene *scene = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if (s.activationState == UISceneActivationStateForegroundActive && [s isKindOfClass:[UIWindowScene class]]) {
-            scene = (UIWindowScene *)s;
-            break;
-        }
+    // If already open, close it (toggle)
+    if (cmOverlayWindow) {
+        cmOverlayWindow.hidden = YES;
+        cmOverlayWindow.rootViewController = nil;
+        cmOverlayWindow = nil;
+        return;
     }
-    if (!scene) return;
+
+    UIWindowScene *scene = CMActiveScene();
+    if (!scene) {
+        NSLog(@"[CopyMody] no scene — cannot present");
+        return;
+    }
+
+    // Capture selection BEFORE overlay steals focus
+    NSString *sel = CMCaptureSelectionNow();
+    if (sel.length > 0) {
+        [[CMHistoryManager shared] addText:sel];
+    }
 
     cmOverlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
-    cmOverlayWindow.windowLevel = UIWindowLevelAlert + 50;
+    cmOverlayWindow.windowLevel = UIWindowLevelAlert + 100;
     cmOverlayWindow.backgroundColor = [UIColor clearColor];
+    cmOverlayWindow.userInteractionEnabled = YES;
 
     CMHistoryViewController *vc = [[CMHistoryViewController alloc] init];
     vc.onDismiss = ^{
@@ -410,39 +428,64 @@ static void CMPresentHistory(void) {
         cmOverlayWindow = nil;
     };
     cmOverlayWindow.rootViewController = vc;
+    cmOverlayWindow.hidden = NO;
     [cmOverlayWindow makeKeyAndVisible];
+
+    NSLog(@"[CopyMody] panel presented");
 }
 
 static void CMShowButton(CGRect kb) {
     UIWindow *kw = CMKeyWindow();
     if (!kw) return;
     CMRemoveButtons();
-    CGFloat s = 36, pad = 6;
-    CGFloat x = kb.origin.x + kb.size.width - s - pad - 4;
-    CGFloat y = kb.origin.y + kb.size.height - s - pad - 4;
-    if (kb.size.height < 50) {
+
+    CGFloat s = 40, pad = 8;
+    CGFloat x = kb.origin.x + kb.size.width - s - pad;
+    CGFloat y = kb.origin.y - s - 6; // ABOVE keyboard, not inside it
+    if (kb.size.height < 50 || y < 40) {
         x = kw.bounds.size.width - s - 12;
-        y = kw.bounds.size.height - 90;
+        y = kw.bounds.size.height - 120;
     }
+
     cmFloatButton = [UIButton buttonWithType:UIButtonTypeCustom];
     cmFloatButton.tag = kButtonTag;
     cmFloatButton.frame = CGRectMake(x, y, s, s);
-    cmFloatButton.backgroundColor = [UIColor colorWithRed:0.18 green:0.42 blue:0.92 alpha:0.92];
+    cmFloatButton.backgroundColor = [UIColor colorWithRed:0.18 green:0.42 blue:0.92 alpha:1.0];
     cmFloatButton.layer.cornerRadius = s / 2;
-    cmFloatButton.layer.shadowOpacity = 0.25;
-    cmFloatButton.layer.shadowRadius = 3;
-    cmFloatButton.layer.shadowOffset = CGSizeMake(0, 1);
+    cmFloatButton.layer.shadowOpacity = 0.35;
+    cmFloatButton.layer.shadowRadius = 4;
+    cmFloatButton.layer.shadowOffset = CGSizeMake(0, 2);
     [cmFloatButton setTitle:@"CM" forState:UIControlStateNormal];
     [cmFloatButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    cmFloatButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) { CMPresentHistory(); }] forControlEvents:UIControlEventTouchUpInside];
+    cmFloatButton.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+
+    // Use target-action (more reliable than UIAction on older paths)
+    [cmFloatButton addTarget:[CMHistoryManager shared] action:@selector(cm_buttonTapped) forControlEvents:UIControlEventTouchUpInside];
+
+    // Fallback: also use UIAction
+    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) {
+        CMPresentHistory();
+    }] forControlEvents:UIControlEventTouchUpInside];
+
     [kw addSubview:cmFloatButton];
+    [kw bringSubviewToFront:cmFloatButton];
 }
+
+// Category so button target works
+@interface CMHistoryManager (Button)
+- (void)cm_buttonTapped;
+@end
+@implementation CMHistoryManager (Button)
+- (void)cm_buttonTapped {
+    CMPresentHistory();
+}
+@end
 
 %hook UIPasteboard
 - (void)setString:(NSString *)string {
     %orig;
-    if (!cmIsSaving && string.length > 0) [[CMHistoryManager shared] addText:string];
+    if (!cmIsSaving && string.length > 0)
+        [[CMHistoryManager shared] addText:string];
 }
 - (void)setStrings:(NSArray<NSString *> *)strings {
     %orig;
@@ -495,7 +538,7 @@ static void CMShowButton(CGRect kb) {
 %ctor {
     int token = 0;
     notify_register_dispatch(kDarwinName, &token, dispatch_get_main_queue(), ^(__unused int t) {
-        NSLog(@"[CopyMody] darwin notify received");
+        NSLog(@"[CopyMody] darwin notify");
     });
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
@@ -504,8 +547,12 @@ static void CMShowButton(CGRect kb) {
         if (kw) kb = [kw convertRect:kb fromWindow:nil];
         CMShowButton(kb);
     }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
+        CMRemoveButtons();
+    }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
+        CMRemoveButtons();
+    }];
 
-    NSLog(@"[CopyMody] v0.1.8 loaded");
+    NSLog(@"[CopyMody] v0.1.9 loaded");
 }
