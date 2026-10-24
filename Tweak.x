@@ -9,7 +9,6 @@ static NSInteger const kButtonTag = 88442211;
 static BOOL cmIsSaving = NO;
 static NSTimeInterval cmLastSaveTime = 0;
 
-// ==================== Helpers ====================
 static NSArray<UIWindow *> *CMAllWindows(void) {
     NSMutableArray *result = [NSMutableArray array];
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -46,13 +45,50 @@ static NSString *CMSelectedTextFromView(UIView *view) {
         id<UITextInput> input = (id<UITextInput>)view;
         UITextRange *range = input.selectedTextRange;
         if (range && !range.isEmpty) {
-            return [input textInRange:range];
+            NSString *t = [input textInRange:range];
+            if (t.length > 0) return t;
         }
     }
     return nil;
 }
 
-// ==================== History Manager ====================
+static UIView *CMFindFirstResponder(UIView *view) {
+    if (!view) return nil;
+    if (view.isFirstResponder) return view;
+    for (UIView *sub in view.subviews) {
+        UIView *found = CMFindFirstResponder(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
+/// Walk view tree looking for any UITextInput with a non-empty selection
+static NSString *CMFindAnySelectedText(UIView *view) {
+    if (!view) return nil;
+    NSString *t = CMSelectedTextFromView(view);
+    if (t.length > 0) return t;
+    for (UIView *sub in view.subviews) {
+        t = CMFindAnySelectedText(sub);
+        if (t.length > 0) return t;
+    }
+    return nil;
+}
+
+static NSString *CMCaptureSelectionNow(void) {
+    // 1) First responder
+    for (UIWindow *w in CMAllWindows()) {
+        UIView *fr = CMFindFirstResponder(w);
+        NSString *t = CMSelectedTextFromView(fr);
+        if (t.length > 0) return t;
+    }
+    // 2) Any selected text in any window (Notes may keep selection without FR after menu)
+    for (UIWindow *w in CMAllWindows()) {
+        NSString *t = CMFindAnySelectedText(w);
+        if (t.length > 0) return t;
+    }
+    return nil;
+}
+
 @interface CMHistoryManager : NSObject
 + (instancetype)shared;
 - (NSArray<NSDictionary *> *)allItems;
@@ -99,9 +135,7 @@ static NSString *CMSelectedTextFromView(UIView *view) {
     });
 }
 
-- (NSArray<NSDictionary *> *)allItems {
-    return [_items copy];
-}
+- (NSArray<NSDictionary *> *)allItems { return [_items copy]; }
 
 - (void)addText:(NSString *)text {
     if (!text) return;
@@ -110,22 +144,14 @@ static NSString *CMSelectedTextFromView(UIView *view) {
     if (t.length > 8000) t = [t substringToIndex:8000];
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - cmLastSaveTime < 0.25) {
-        // still allow if different text
-        if (_items.count > 0 && [_items.firstObject[@"text"] isEqualToString:t]) return;
-    }
+    if (_items.count > 0 && [_items.firstObject[@"text"] isEqualToString:t]) return;
     cmLastSaveTime = now;
 
-    if (_items.count > 0 && [_items.firstObject[@"text"] isEqualToString:t]) return;
-
-    NSDictionary *entry = @{
-        @"text" : t,
-        @"timestamp" : @((NSInteger)now)
-    };
+    NSDictionary *entry = @{ @"text" : t, @"timestamp" : @((NSInteger)now) };
     [_items insertObject:entry atIndex:0];
     while ((NSInteger)_items.count > kMaxHistoryItems) [_items removeLastObject];
     [self saveAsync];
-    NSLog(@"[CopyMody] saved: %@ (%lu)", [t substringToIndex:MIN((NSUInteger)40, t.length)], (unsigned long)_items.count);
+    NSLog(@"[CopyMody] saved (%lu): %@", (unsigned long)_items.count, [t substringToIndex:MIN((NSUInteger)40, t.length)]);
 }
 
 - (void)removeItemAtIndex:(NSInteger)index {
@@ -141,7 +167,6 @@ static NSString *CMSelectedTextFromView(UIView *view) {
 
 @end
 
-// ==================== UI ====================
 @interface CMHistoryViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray *items;
@@ -189,7 +214,7 @@ static NSString *CMSelectedTextFromView(UIView *view) {
     [card addSubview:self.tableView];
 
     self.emptyLabel = [[UILabel alloc] init];
-    self.emptyLabel.text = @"لا يوجد عناصر\nحدّد نصاً ثم اضغط نسخ";
+    self.emptyLabel.text = @"لا يوجد عناصر\nحدّد نصاً ثم اضغط 📋";
     self.emptyLabel.textAlignment = NSTextAlignmentCenter;
     self.emptyLabel.numberOfLines = 2;
     self.emptyLabel.textColor = [UIColor secondaryLabelColor];
@@ -250,9 +275,7 @@ static NSString *CMSelectedTextFromView(UIView *view) {
     [[UIPasteboard generalPasteboard] setString:text];
     cmIsSaving = NO;
 
-    UIView *fr = nil;
-    UIWindow *kw = CMKeyWindow();
-    fr = [self findFR:kw];
+    UIView *fr = CMFindFirstResponder(CMKeyWindow());
     if ([fr isKindOfClass:[UITextField class]]) [(UITextField *)fr insertText:text];
     else if ([fr isKindOfClass:[UITextView class]]) [(UITextView *)fr insertText:text];
     else if ([fr respondsToSelector:@selector(paste:)]) [fr paste:nil];
@@ -285,19 +308,8 @@ static NSString *CMSelectedTextFromView(UIView *view) {
     }];
 }
 
-- (UIView *)findFR:(UIView *)v {
-    if (!v) return nil;
-    if (v.isFirstResponder) return v;
-    for (UIView *s in v.subviews) {
-        UIView *f = [self findFR:s];
-        if (f) return f;
-    }
-    return nil;
-}
-
 @end
 
-// ==================== Button ====================
 static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
 
@@ -312,6 +324,13 @@ static void CMRemoveButtons(void) {
 
 static void CMPresentHistory(void) {
     if (cmOverlayWindow) return;
+
+    // Capture currently selected text BEFORE showing overlay (key for Notes)
+    NSString *selected = CMCaptureSelectionNow();
+    if (selected.length > 0) {
+        [[CMHistoryManager shared] addText:selected];
+    }
+
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if (s.activationState == UISceneActivationStateForegroundActive && [s isKindOfClass:[UIWindowScene class]]) {
@@ -362,56 +381,37 @@ static void CMShowButton(CGRect kb) {
     [kw addSubview:cmFloatButton];
 }
 
-// ==================== Capture selected text on Copy ====================
-
-static void CMHandleCopyFromResponder(id self_) {
-    if (cmIsSaving) return;
-    if (![self_ isKindOfClass:[UIView class]]) return;
-    NSString *sel = CMSelectedTextFromView((UIView *)self_);
-    if (sel.length > 0) {
-        [[CMHistoryManager shared] addText:sel];
-    }
-}
-
 %hook UIResponder
-
 - (void)copy:(id)sender {
-    CMHandleCopyFromResponder(self);
+    if (!cmIsSaving && [self isKindOfClass:[UIView class]]) {
+        NSString *sel = CMSelectedTextFromView((UIView *)self);
+        if (sel.length > 0) [[CMHistoryManager shared] addText:sel];
+    }
     %orig;
 }
-
 %end
 
 %hook UITextView
-
 - (void)copy:(id)sender {
     NSString *sel = CMSelectedTextFromView(self);
     if (sel.length > 0) [[CMHistoryManager shared] addText:sel];
     %orig;
 }
-
 %end
 
 %hook UITextField
-
 - (void)copy:(id)sender {
     NSString *sel = CMSelectedTextFromView(self);
     if (sel.length > 0) [[CMHistoryManager shared] addText:sel];
     %orig;
 }
-
 %end
 
-// Backup: pasteboard hooks (no .string reads)
 %hook UIPasteboard
-
 - (void)setString:(NSString *)string {
     %orig;
-    if (!cmIsSaving && string.length > 0) {
-        [[CMHistoryManager shared] addText:string];
-    }
+    if (!cmIsSaving && string.length > 0) [[CMHistoryManager shared] addText:string];
 }
-
 - (void)setItems:(NSArray *)items {
     %orig;
     if (cmIsSaving || items.count == 0) return;
@@ -427,7 +427,6 @@ static void CMHandleCopyFromResponder(id self_) {
         }
     }
 }
-
 %end
 
 %ctor {
@@ -437,11 +436,7 @@ static void CMHandleCopyFromResponder(id self_) {
         if (kw) kb = [kw convertRect:kb fromWindow:nil];
         CMShowButton(kb);
     }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
-        CMRemoveButtons();
-    }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
-        CMRemoveButtons();
-    }];
-    NSLog(@"[CopyMody] v0.1.5 loaded");
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
+    NSLog(@"[CopyMody] v0.1.6 loaded");
 }
