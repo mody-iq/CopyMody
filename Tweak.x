@@ -123,6 +123,9 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     return @[jb1, logical1, jb2, logical2];
 }
 
+// Forward declare present function
+static void CMPresentHistory(void);
+
 @interface CMHistoryManager : NSObject
 + (instancetype)shared;
 - (NSArray<NSDictionary *> *)allItems;
@@ -222,6 +225,10 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [self persist];
 }
 
+- (void)cm_openPanel {
+    CMPresentHistory();
+}
+
 @end
 
 @interface CMHistoryViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
@@ -299,7 +306,6 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         [self.emptyLabel.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor]
     ]];
 
-    // Close only when tapping dimmed area (not the card)
     UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(bgTapped:)];
     [self.view addGestureRecognizer:bgTap];
 
@@ -399,7 +405,7 @@ static void CMRemoveButtons(void) {
 
 static void CMPresentHistory(void) {
     if (cmPresenting) return;
-    if (cmOverlayWindow) return; // already open — do not toggle-close
+    if (cmOverlayWindow) return;
 
     cmPresenting = YES;
 
@@ -428,7 +434,6 @@ static void CMPresentHistory(void) {
     cmOverlayWindow.rootViewController = vc;
     [cmOverlayWindow makeKeyAndVisible];
 
-    // Release presenting lock shortly after show
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         cmPresenting = NO;
     });
@@ -436,17 +441,10 @@ static void CMPresentHistory(void) {
     NSLog(@"[CopyMody] panel shown");
 }
 
-@implementation CMHistoryManager (Button)
-- (void)cm_openPanel {
-    CMPresentHistory();
-}
-@end
-
 static void CMShowButton(CGRect kb) {
     UIWindow *kw = CMKeyWindow();
     if (!kw) return;
 
-    // If a valid button already exists on this key window, just update frame
     if (cmFloatButton && cmFloatButton.superview == kw) {
         CGFloat s = 40, pad = 8;
         CGFloat x = kb.origin.x + kb.size.width - s - pad;
@@ -482,7 +480,6 @@ static void CMShowButton(CGRect kb) {
     [cmFloatButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     cmFloatButton.titleLabel.font = [UIFont boldSystemFontOfSize:13];
 
-    // ONE handler only
     [cmFloatButton addTarget:[CMHistoryManager shared]
                       action:@selector(cm_openPanel)
             forControlEvents:UIControlEventTouchUpInside];
@@ -556,7 +553,6 @@ static void CMShowButton(CGRect kb) {
         CMShowButton(kb);
     }];
 
-    // Do NOT remove button on WillHide if panel is open (avoids flicker)
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
         if (!cmOverlayWindow) CMRemoveButtons();
     }];
