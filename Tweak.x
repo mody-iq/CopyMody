@@ -2,13 +2,18 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-static NSString * const kHistoryFileName = @"com.mody.copymody.history.json";
+// RootHide API (stub when not roothide)
+#include <roothide.h>
+
+static NSString * const kSuiteName = @"com.mody.copymody.history";
+static NSString * const kHistoryKey = @"items";
 static NSInteger const kMaxHistoryItems = 50;
 static NSInteger const kButtonTag = 88442211;
 
 static BOOL cmIsSaving = NO;
-static NSTimeInterval cmLastSaveTime = 0;
+static NSTimeInterval cmLastCapture = 0;
 
+// ==================== Helpers ====================
 static NSArray<UIWindow *> *CMAllWindows(void) {
     NSMutableArray *result = [NSMutableArray array];
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -26,43 +31,24 @@ static UIWindow *CMKeyWindow(void) {
     return CMAllWindows().firstObject;
 }
 
-static NSString *CMHistoryPath(void) {
-    NSString *pref = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@", kHistoryFileName];
-    NSString *lib  = [NSString stringWithFormat:@"/var/mobile/Library/CopyMody/%@", kHistoryFileName];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:pref.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
-    [fm createDirectoryAtPath:lib.stringByDeletingLastPathComponent  withIntermediateDirectories:YES attributes:nil error:nil];
-    if ([fm fileExistsAtPath:pref]) return pref;
-    if ([fm fileExistsAtPath:lib])  return lib;
-    if ([@"[]" writeToFile:pref atomically:YES encoding:NSUTF8StringEncoding error:nil]) return pref;
-    if ([@"[]" writeToFile:lib  atomically:YES encoding:NSUTF8StringEncoding error:nil]) return lib;
-    return [NSTemporaryDirectory() stringByAppendingPathComponent:kHistoryFileName];
-}
-
-static NSString *CMSelectedTextFromView(UIView *view) {
-    if (!view) return nil;
-    if ([view conformsToProtocol:@protocol(UITextInput)]) {
-        id<UITextInput> input = (id<UITextInput>)view;
-        UITextRange *range = input.selectedTextRange;
-        if (range && !range.isEmpty) {
-            NSString *t = [input textInRange:range];
-            if (t.length > 0) return t;
-        }
-    }
-    return nil;
-}
-
 static UIView *CMFindFirstResponder(UIView *view) {
     if (!view) return nil;
     if (view.isFirstResponder) return view;
     for (UIView *sub in view.subviews) {
-        UIView *found = CMFindFirstResponder(sub);
-        if (found) return found;
+        UIView *f = CMFindFirstResponder(sub);
+        if (f) return f;
     }
     return nil;
 }
 
-/// Walk view tree looking for any UITextInput with a non-empty selection
+static NSString *CMSelectedTextFromView(UIView *view) {
+    if (!view || ![view conformsToProtocol:@protocol(UITextInput)]) return nil;
+    id<UITextInput> input = (id<UITextInput>)view;
+    UITextRange *range = input.selectedTextRange;
+    if (!range || range.isEmpty) return nil;
+    return [input textInRange:range];
+}
+
 static NSString *CMFindAnySelectedText(UIView *view) {
     if (!view) return nil;
     NSString *t = CMSelectedTextFromView(view);
@@ -75,13 +61,11 @@ static NSString *CMFindAnySelectedText(UIView *view) {
 }
 
 static NSString *CMCaptureSelectionNow(void) {
-    // 1) First responder
     for (UIWindow *w in CMAllWindows()) {
         UIView *fr = CMFindFirstResponder(w);
         NSString *t = CMSelectedTextFromView(fr);
         if (t.length > 0) return t;
     }
-    // 2) Any selected text in any window (Notes may keep selection without FR after menu)
     for (UIWindow *w in CMAllWindows()) {
         NSString *t = CMFindAnySelectedText(w);
         if (t.length > 0) return t;
@@ -89,9 +73,25 @@ static NSString *CMCaptureSelectionNow(void) {
     return nil;
 }
 
+/// RootHide-compatible history file path
+static NSString *CMHistoryFilePath(void) {
+    // jbroot converts path for RootHide bootstrap; no-op stub on other schemes
+    NSString *logical = @"/var/mobile/Library/Preferences/com.mody.copymody.history.json";
+    NSString *path = jbroot(logical);
+    if (!path.length) path = logical;
+
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+    return path;
+}
+
+// ==================== History Manager ====================
 @interface CMHistoryManager : NSObject
 + (instancetype)shared;
-- (NSArray<NSDictionary *> *)allItems;
+- (NSArray<NSDictionary *> *)allItems;   // reloads from disk every time
 - (void)addText:(NSString *)text;
 - (void)removeItemAtIndex:(NSInteger)index;
 - (void)clearAll;
@@ -99,7 +99,8 @@ static NSString *CMCaptureSelectionNow(void) {
 
 @implementation CMHistoryManager {
     NSMutableArray<NSDictionary *> *_items;
-    NSString *_path;
+    NSString *_filePath;
+    NSUserDefaults *_defaults;
     dispatch_queue_t _ioQueue;
 }
 
@@ -113,60 +114,92 @@ static NSString *CMCaptureSelectionNow(void) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _path = CMHistoryPath();
-        _items = [NSMutableArray array];
+        _filePath = CMHistoryFilePath();
+        _defaults = [[NSUserDefaults alloc] initWithSuiteName:kSuiteName];
         _ioQueue = dispatch_queue_create("com.mody.copymody.io", DISPATCH_QUEUE_SERIAL);
-        NSData *data = [NSData dataWithContentsOfFile:_path];
-        if (data) {
-            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if ([obj isKindOfClass:[NSArray class]]) _items = [obj mutableCopy];
-        }
-        NSLog(@"[CopyMody] path=%@ items=%lu", _path, (unsigned long)_items.count);
+        _items = [NSMutableArray array];
+        [self loadFromDisk];
+        NSLog(@"[CopyMody] history path = %@", _filePath);
     }
     return self;
 }
 
-- (void)saveAsync {
+- (void)loadFromDisk {
+    // 1) JSON file (primary, shared via jbroot)
+    NSData *data = [NSData dataWithContentsOfFile:_filePath];
+    if (data) {
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if ([obj isKindOfClass:[NSArray class]]) {
+            _items = [obj mutableCopy];
+            return;
+        }
+    }
+    // 2) NSUserDefaults suite fallback
+    NSArray *arr = [_defaults arrayForKey:kHistoryKey];
+    if ([arr isKindOfClass:[NSArray class]] && arr.count > 0) {
+        _items = [arr mutableCopy];
+    }
+}
+
+- (void)persist {
     NSArray *snap = [_items copy];
-    NSString *path = _path;
+    NSString *path = _filePath;
+    NSUserDefaults *defs = _defaults;
+
     dispatch_async(_ioQueue, ^{
         NSData *data = [NSJSONSerialization dataWithJSONObject:snap options:0 error:nil];
-        if (data) [data writeToFile:path atomically:YES];
+        if (data) {
+            BOOL ok = [data writeToFile:path atomically:YES];
+            NSLog(@"[CopyMody] write %@ → %@", ok ? @"OK" : @"FAIL", path);
+        }
+        [defs setObject:snap forKey:kHistoryKey];
+        [defs synchronize];
     });
 }
 
-- (NSArray<NSDictionary *> *)allItems { return [_items copy]; }
+- (NSArray<NSDictionary *> *)allItems {
+    [self loadFromDisk]; // always fresh before UI shows
+    return [_items copy];
+}
 
 - (void)addText:(NSString *)text {
-    if (!text) return;
+    if (!text || cmIsSaving) return;
     NSString *t = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (t.length == 0) return;
     if (t.length > 8000) t = [t substringToIndex:8000];
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (_items.count > 0 && [_items.firstObject[@"text"] isEqualToString:t]) return;
-    cmLastSaveTime = now;
+    if (now - cmLastCapture < 0.2) {
+        if (_items.count > 0 && [_items.firstObject[@"text"] isEqualToString:t]) return;
+    }
+    cmLastCapture = now;
 
-    NSDictionary *entry = @{ @"text" : t, @"timestamp" : @((NSInteger)now) };
+    [self loadFromDisk];
+    if (_items.count > 0 && [_items.firstObject[@"text"] isEqualToString:t]) return;
+
+    NSDictionary *entry = @{ @"text": t, @"timestamp": @((NSInteger)now) };
     [_items insertObject:entry atIndex:0];
     while ((NSInteger)_items.count > kMaxHistoryItems) [_items removeLastObject];
-    [self saveAsync];
-    NSLog(@"[CopyMody] saved (%lu): %@", (unsigned long)_items.count, [t substringToIndex:MIN((NSUInteger)40, t.length)]);
+    [self persist];
+    NSLog(@"[CopyMody] +item (%lu) %@", (unsigned long)_items.count,
+          [t substringToIndex:MIN((NSUInteger)40, t.length)]);
 }
 
 - (void)removeItemAtIndex:(NSInteger)index {
+    [self loadFromDisk];
     if (index < 0 || index >= (NSInteger)_items.count) return;
     [_items removeObjectAtIndex:index];
-    [self saveAsync];
+    [self persist];
 }
 
 - (void)clearAll {
     [_items removeAllObjects];
-    [self saveAsync];
+    [self persist];
 }
 
 @end
 
+// ==================== UI ====================
 @interface CMHistoryViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray *items;
@@ -214,7 +247,7 @@ static NSString *CMCaptureSelectionNow(void) {
     [card addSubview:self.tableView];
 
     self.emptyLabel = [[UILabel alloc] init];
-    self.emptyLabel.text = @"لا يوجد عناصر\nحدّد نصاً ثم اضغط 📋";
+    self.emptyLabel.text = @"لا يوجد عناصر\nحدّد نصاً أو انسخ ثم اضغط 📋";
     self.emptyLabel.textAlignment = NSTextAlignmentCenter;
     self.emptyLabel.numberOfLines = 2;
     self.emptyLabel.textColor = [UIColor secondaryLabelColor];
@@ -241,6 +274,7 @@ static NSString *CMCaptureSelectionNow(void) {
         [self.emptyLabel.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor]
     ]];
 
+    // Force reload from disk before showing
     [self reload];
 }
 
@@ -310,6 +344,7 @@ static NSString *CMCaptureSelectionNow(void) {
 
 @end
 
+// ==================== Button / Present ====================
 static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
 
@@ -325,11 +360,9 @@ static void CMRemoveButtons(void) {
 static void CMPresentHistory(void) {
     if (cmOverlayWindow) return;
 
-    // Capture currently selected text BEFORE showing overlay (key for Notes)
-    NSString *selected = CMCaptureSelectionNow();
-    if (selected.length > 0) {
-        [[CMHistoryManager shared] addText:selected];
-    }
+    // Capture selection if any (Notes flow)
+    NSString *sel = CMCaptureSelectionNow();
+    if (sel.length > 0) [[CMHistoryManager shared] addText:sel];
 
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -371,15 +404,55 @@ static void CMShowButton(CGRect kb) {
     cmFloatButton.tag = kButtonTag;
     cmFloatButton.frame = CGRectMake(x, y, s, s);
     cmFloatButton.backgroundColor = [UIColor colorWithRed:0.18 green:0.42 blue:0.92 alpha:0.92];
-    cmFloatButton.layer.cornerRadius = s/2;
+    cmFloatButton.layer.cornerRadius = s / 2;
     cmFloatButton.layer.shadowOpacity = 0.25;
     cmFloatButton.layer.shadowRadius = 3;
     cmFloatButton.layer.shadowOffset = CGSizeMake(0, 1);
     [cmFloatButton setTitle:@"📋" forState:UIControlStateNormal];
     cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:17];
-    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) { CMPresentHistory(); }] forControlEvents:UIControlEventTouchUpInside];
+    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) {
+        CMPresentHistory();
+    }] forControlEvents:UIControlEventTouchUpInside];
     [kw addSubview:cmFloatButton];
 }
+
+// ==================== Pasteboard Hooks ====================
+%hook UIPasteboard
+
+- (void)setString:(NSString *)string {
+    %orig;
+    if (!cmIsSaving && string.length > 0) {
+        [[CMHistoryManager shared] addText:string];
+    }
+}
+
+- (void)setStrings:(NSArray<NSString *> *)strings {
+    %orig;
+    if (!cmIsSaving && strings.count > 0 && [strings.firstObject length] > 0) {
+        [[CMHistoryManager shared] addText:strings.firstObject];
+    }
+}
+
+- (void)setItems:(NSArray *)items {
+    %orig;
+    if (cmIsSaving || items.count == 0) return;
+    for (NSDictionary *item in items) {
+        id val = item[@"public.utf8-plain-text"] ?: item[@"public.plain-text"] ?: item[@"public.text"];
+        if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
+            [[CMHistoryManager shared] addText:val];
+            return;
+        }
+        if ([val isKindOfClass:[NSData class]]) {
+            NSString *s = [[NSString alloc] initWithData:val encoding:NSUTF8StringEncoding];
+            if (s.length > 0) {
+                [[CMHistoryManager shared] addText:s];
+                return;
+            }
+        }
+    }
+}
+
+%end
 
 %hook UIResponder
 - (void)copy:(id)sender {
@@ -407,36 +480,35 @@ static void CMShowButton(CGRect kb) {
 }
 %end
 
-%hook UIPasteboard
-- (void)setString:(NSString *)string {
-    %orig;
-    if (!cmIsSaving && string.length > 0) [[CMHistoryManager shared] addText:string];
-}
-- (void)setItems:(NSArray *)items {
-    %orig;
-    if (cmIsSaving || items.count == 0) return;
-    for (NSDictionary *item in items) {
-        id val = item[@"public.utf8-plain-text"] ?: item[@"public.plain-text"];
-        if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
-            [[CMHistoryManager shared] addText:val];
-            return;
-        }
-        if ([val isKindOfClass:[NSData class]]) {
-            NSString *s = [[NSString alloc] initWithData:val encoding:NSUTF8StringEncoding];
-            if (s.length > 0) { [[CMHistoryManager shared] addText:s]; return; }
-        }
-    }
-}
-%end
-
 %ctor {
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
+    // Notification: do NOT call pasteboard.string (freezes on iOS 18).
+    // Only used as a lightweight signal; actual text comes from hooks.
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIPasteboardChangedNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *note) {
+        // Intentionally empty – hooks already capture content safely
+    }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *n) {
         CGRect kb = [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
         UIWindow *kw = CMKeyWindow();
         if (kw) kb = [kw convertRect:kb fromWindow:nil];
         CMShowButton(kb);
     }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
-    NSLog(@"[CopyMody] v0.1.6 loaded");
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *n) { CMRemoveButtons(); }];
+
+    NSLog(@"[CopyMody] v0.1.7 loaded (jbroot + hooks)");
 }
