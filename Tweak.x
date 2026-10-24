@@ -7,7 +7,7 @@
 
 static NSString * const kSuiteName = @"com.mody.copymody.history";
 static NSString * const kHistoryKey = @"items";
-static NSString * const kDarwinName = "com.mody.copymody.history.changed";
+static const char *kDarwinName = "com.mody.copymody.history.changed";
 static NSInteger const kMaxHistoryItems = 50;
 static NSInteger const kButtonTag = 88442211;
 
@@ -51,7 +51,6 @@ static NSString *CMSelectedTextFromView(UIView *view) {
             if (t.length > 0) return t;
         }
     }
-    // Fallbacks
     if ([view isKindOfClass:[UITextView class]]) {
         UITextView *tv = (UITextView *)view;
         if (tv.selectedRange.length > 0 && tv.text.length > 0) {
@@ -91,11 +90,9 @@ static NSString *CMCaptureSelectionNow(void) {
     return nil;
 }
 
-/// Safe pasteboard read – only if hasStrings, never blocks with patterns API spam
 static NSString *CMSafePasteboardString(void) {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
     if (!pb.hasStrings) return nil;
-    // Accessing .string may show system paste banner once; acceptable on explicit user open
     @try {
         NSString *s = pb.string;
         if (s.length > 0) return s;
@@ -116,7 +113,6 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         NSString *dir = [p stringByDeletingLastPathComponent];
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    // Prefer jbroot path first, then raw, then alt
     return @[jb1, logical1, jb2, logical2];
 }
 
@@ -179,12 +175,11 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         if (data) {
             for (NSString *path in CMHistoryPaths()) {
                 BOOL ok = [data writeToFile:path atomically:YES];
-                NSLog(@"[CopyMody] write %@ → %@", ok ? @"OK" : @"FAIL", path);
+                NSLog(@"[CopyMody] write %@ \u2192 %@", ok ? @"OK" : @"FAIL", path);
             }
         }
         [defs setObject:snap forKey:kHistoryKey];
         [defs synchronize];
-        // Darwin notify for other processes
         notify_post(kDarwinName);
     });
 }
@@ -265,13 +260,13 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [card addSubview:title];
 
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [clearBtn setTitle:@"مسح الكل" forState:UIControlStateNormal];
+    [clearBtn setTitle:@"\u0645\u0633\u062d \u0627\u0644\u0643\u0644" forState:UIControlStateNormal];
     [clearBtn addTarget:self action:@selector(clearAll) forControlEvents:UIControlEventTouchUpInside];
     clearBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:clearBtn];
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [closeBtn setTitle:@"إغلاق" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"\u0625\u063a\u0644\u0627\u0642" forState:UIControlStateNormal];
     [closeBtn addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
     closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:closeBtn];
@@ -285,7 +280,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [card addSubview:self.tableView];
 
     self.emptyLabel = [[UILabel alloc] init];
-    self.emptyLabel.text = @"لا يوجد عناصر\nانسخ نصاً ثم اضغط 📋";
+    self.emptyLabel.text = @"\u0644\u0627 \u064a\u0648\u062c\u062f \u0639\u0646\u0627\u0635\u0631\n\u0627\u0646\u0633\u062e \u0646\u0635\u0627\u064b \u062b\u0645 \u0627\u0636\u063a\u0637 \ud83d\udccb";
     self.emptyLabel.textAlignment = NSTextAlignmentCenter;
     self.emptyLabel.numberOfLines = 2;
     self.emptyLabel.textColor = [UIColor secondaryLabelColor];
@@ -352,7 +347,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
-    UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"حذف" handler:^(__unused UIContextualAction *a, __unused UIView *v, void (^done)(BOOL)) {
+    UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"\u062d\u0630\u0641" handler:^(__unused UIContextualAction *a, __unused UIView *v, void (^done)(BOOL)) {
         [[CMHistoryManager shared] removeItemAtIndex:ip.row];
         [self reload];
         done(YES);
@@ -361,9 +356,9 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 }
 
 - (void)clearAll {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"مسح السجل" message:@"حذف الكل؟" preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"إلغاء" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"مسح" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"\u0645\u0633\u062d \u0627\u0644\u0633\u062c\u0644" message:@"\u062d\u0630\u0641 \u0627\u0644\u0643\u0644\u061f" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"\u0625\u0644\u063a\u0627\u0621" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"\u0645\u0633\u062d" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
         [[CMHistoryManager shared] clearAll];
         [self reload];
     }]];
@@ -393,7 +388,6 @@ static void CMRemoveButtons(void) {
 static void CMPresentHistory(void) {
     if (cmOverlayWindow) return;
 
-    // Direct import: selection + pasteboard (user-requested fallback)
     [[CMHistoryManager shared] importFromPasteboardAndSelection];
 
     UIWindowScene *scene = nil;
@@ -438,7 +432,7 @@ static void CMShowButton(CGRect kb) {
     cmFloatButton.layer.shadowOpacity = 0.25;
     cmFloatButton.layer.shadowRadius = 3;
     cmFloatButton.layer.shadowOffset = CGSizeMake(0, 1);
-    [cmFloatButton setTitle:@"📋" forState:UIControlStateNormal];
+    [cmFloatButton setTitle:@"\ud83d\udccb" forState:UIControlStateNormal];
     cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:17];
     [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) { CMPresentHistory(); }] forControlEvents:UIControlEventTouchUpInside];
     [kw addSubview:cmFloatButton];
@@ -498,10 +492,8 @@ static void CMShowButton(CGRect kb) {
 %end
 
 %ctor {
-    // Darwin notify – reload in-memory when another process saves
     int token = 0;
     notify_register_dispatch(kDarwinName, &token, dispatch_get_main_queue(), ^(__unused int t) {
-        // Next allItems call will loadFromDisk
         NSLog(@"[CopyMody] darwin notify received");
     });
 
