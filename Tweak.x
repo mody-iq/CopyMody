@@ -16,6 +16,9 @@ static NSTimeInterval cmLastCapture = 0;
 static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
 static BOOL cmPresenting = NO;
+static __weak UIView *cmSavedFirstResponder = nil;
+
+static void CMPresentHistory(void);
 
 static NSArray<UIWindow *> *CMAllWindows(void) {
     NSMutableArray *result = [NSMutableArray array];
@@ -59,6 +62,14 @@ static UIView *CMFindFirstResponder(UIView *view) {
     return nil;
 }
 
+static UIView *CMFindAnyFirstResponder(void) {
+    for (UIWindow *w in CMAllWindows()) {
+        UIView *fr = CMFindFirstResponder(w);
+        if (fr) return fr;
+    }
+    return nil;
+}
+
 static NSString *CMSelectedTextFromView(UIView *view) {
     if (!view) return nil;
     if ([view conformsToProtocol:@protocol(UITextInput)]) {
@@ -97,16 +108,53 @@ static NSString *CMFindAnySelectedText(UIView *view) {
 }
 
 static NSString *CMCaptureSelectionNow(void) {
+    UIView *fr = CMFindAnyFirstResponder();
+    NSString *t = CMSelectedTextFromView(fr);
+    if (t.length > 0) return t;
     for (UIWindow *w in CMAllWindows()) {
-        UIView *fr = CMFindFirstResponder(w);
-        NSString *t = CMSelectedTextFromView(fr);
-        if (t.length > 0) return t;
-    }
-    for (UIWindow *w in CMAllWindows()) {
-        NSString *t = CMFindAnySelectedText(w);
+        t = CMFindAnySelectedText(w);
         if (t.length > 0) return t;
     }
     return nil;
+}
+
+static void CMPasteText(NSString *text) {
+    if (!text.length) return;
+
+    cmIsSaving = YES;
+    [[UIPasteboard generalPasteboard] setString:text];
+    cmIsSaving = NO;
+
+    UIView *target = cmSavedFirstResponder;
+    if (!target || !target.window) {
+        target = CMFindAnyFirstResponder();
+    }
+
+    if (target) {
+        // Restore focus then insert
+        if (!target.isFirstResponder) {
+            [target becomeFirstResponder];
+        }
+        if ([target isKindOfClass:[UITextField class]]) {
+            [(UITextField *)target insertText:text];
+            return;
+        }
+        if ([target isKindOfClass:[UITextView class]]) {
+            [(UITextView *)target insertText:text];
+            return;
+        }
+        if ([target conformsToProtocol:@protocol(UIKeyInput)]) {
+            [(id<UIKeyInput>)target insertText:text];
+            return;
+        }
+        if ([target respondsToSelector:@selector(paste:)]) {
+            [target paste:nil];
+            return;
+        }
+    }
+
+    // Last resort: send paste to first responder via UIApplication
+    [[UIApplication sharedApplication] sendAction:@selector(paste:) to:nil from:nil forEvent:nil];
 }
 
 static NSArray<NSString *> *CMHistoryPaths(void) {
@@ -122,9 +170,6 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     }
     return @[jb1, logical1, jb2, logical2];
 }
-
-// Forward declare present function
-static void CMPresentHistory(void);
 
 @interface CMHistoryManager : NSObject
 + (instancetype)shared;
@@ -310,15 +355,6 @@ static void CMPresentHistory(void);
     [self.view addGestureRecognizer:bgTap];
 
     [self reload];
-
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NSString *sel = CMCaptureSelectionNow();
-        if (sel.length > 0) {
-            [[CMHistoryManager shared] addText:sel];
-            [weakSelf reload];
-        }
-    });
 }
 
 - (void)bgTapped:(UITapGestureRecognizer *)gr {
@@ -354,14 +390,15 @@ static void CMPresentHistory(void);
     [tv deselectRowAtIndexPath:ip animated:YES];
     NSString *text = self.items[ip.row][@"text"];
     if (!text) return;
-    cmIsSaving = YES;
-    [[UIPasteboard generalPasteboard] setString:text];
-    cmIsSaving = NO;
-    UIView *fr = CMFindFirstResponder(CMKeyWindow());
-    if ([fr isKindOfClass:[UITextField class]]) [(UITextField *)fr insertText:text];
-    else if ([fr isKindOfClass:[UITextView class]]) [(UITextView *)fr insertText:text];
-    else if ([fr respondsToSelector:@selector(paste:)]) [fr paste:nil];
-    [self close];
+
+    // Close first so original text field can become first responder again
+    [self dismissViewControllerAnimated:NO completion:^{
+        if (self.onDismiss) self.onDismiss();
+        // Small delay then paste
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            CMPasteText(text);
+        });
+    }];
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
@@ -397,22 +434,19 @@ static void CMRemoveButtons(void) {
             if (v.tag == kButtonTag) [v removeFromSuperview];
         }
     }
-    if (cmFloatButton) {
-        [cmFloatButton removeFromSuperview];
-        cmFloatButton = nil;
-    }
+    cmFloatButton = nil;
 }
 
 static void CMPresentHistory(void) {
-    if (cmPresenting) return;
-    if (cmOverlayWindow) return;
-
+    if (cmPresenting || cmOverlayWindow) return;
     cmPresenting = YES;
+
+    // Save first responder BEFORE overlay steals key
+    cmSavedFirstResponder = CMFindAnyFirstResponder();
 
     UIWindowScene *scene = CMActiveScene();
     if (!scene) {
         cmPresenting = NO;
-        NSLog(@"[CopyMody] no scene");
         return;
     }
 
@@ -434,31 +468,22 @@ static void CMPresentHistory(void) {
     cmOverlayWindow.rootViewController = vc;
     [cmOverlayWindow makeKeyAndVisible];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         cmPresenting = NO;
     });
-
-    NSLog(@"[CopyMody] panel shown");
 }
 
 static void CMShowButton(CGRect kb) {
     UIWindow *kw = CMKeyWindow();
     if (!kw) return;
 
-    if (cmFloatButton && cmFloatButton.superview == kw) {
-        CGFloat s = 40, pad = 8;
-        CGFloat x = kb.origin.x + kb.size.width - s - pad;
-        CGFloat y = kb.origin.y - s - 8;
-        if (kb.size.height < 50 || y < 40) {
-            x = kw.bounds.size.width - s - 12;
-            y = kw.bounds.size.height - 120;
+    // Always wipe every tagged button first (fixes Notes double-window)
+    for (UIWindow *w in CMAllWindows()) {
+        for (UIView *v in [w.subviews copy]) {
+            if (v.tag == kButtonTag) [v removeFromSuperview];
         }
-        cmFloatButton.frame = CGRectMake(x, y, s, s);
-        [kw bringSubviewToFront:cmFloatButton];
-        return;
     }
-
-    CMRemoveButtons();
+    cmFloatButton = nil;
 
     CGFloat s = 40, pad = 8;
     CGFloat x = kb.origin.x + kb.size.width - s - pad;
@@ -557,5 +582,5 @@ static void CMShowButton(CGRect kb) {
         if (!cmOverlayWindow) CMRemoveButtons();
     }];
 
-    NSLog(@"[CopyMody] v0.1.10 loaded");
+    NSLog(@"[CopyMody] v0.1.11 loaded");
 }
