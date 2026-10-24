@@ -3,7 +3,7 @@
 #import <objc/runtime.h>
 
 // ==================== Constants ====================
-static NSString * const kHistoryPath = @"/var/mobile/Library/Preferences/com.mody.copymody.history.plist";
+static NSString * const kHistoryFileName = @"com.mody.copymody.history.json";
 static NSInteger const kMaxHistoryItems = 50;
 static NSInteger const kButtonTag = 88442211;
 
@@ -25,18 +25,48 @@ static UIWindow *CMKeyWindow(void) {
     return CMAllWindows().firstObject;
 }
 
+/// Returns a writable path that works under RootHide / normal jailbreaks
+static NSString *CMHistoryPath(void) {
+    // 1) Preferred: mobile Preferences
+    NSString *pref = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@", kHistoryFileName];
+    // 2) Fallback: Library/CopyMody
+    NSString *lib  = [NSString stringWithFormat:@"/var/mobile/Library/CopyMody/%@", kHistoryFileName];
+    // 3) Last resort: tmp (still better than nothing for testing)
+    NSString *tmp  = [NSTemporaryDirectory() stringByAppendingPathComponent:kHistoryFileName];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Ensure dirs exist
+    [fm createDirectoryAtPath:[pref stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:[lib  stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Prefer existing file location
+    if ([fm fileExistsAtPath:pref]) return pref;
+    if ([fm fileExistsAtPath:lib])  return lib;
+
+    // Try write test on pref
+    if ([@"[]" writeToFile:pref atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+        return pref;
+    }
+    if ([@"[]" writeToFile:lib atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+        return lib;
+    }
+    return tmp;
+}
+
 // ==================== History Manager ====================
 @interface CMHistoryManager : NSObject
 + (instancetype)shared;
 - (NSArray<NSDictionary *> *)allItems;
-- (void)reloadFromDisk;
 - (void)addText:(NSString *)text;
 - (void)removeItemAtIndex:(NSInteger)index;
 - (void)clearAll;
+- (void)captureCurrentPasteboard;
 @end
 
 @implementation CMHistoryManager {
     NSMutableArray<NSDictionary *> *_items;
+    NSString *_path;
 }
 
 + (instancetype)shared {
@@ -51,67 +81,106 @@ static UIWindow *CMKeyWindow(void) {
 - (instancetype)init {
     self = [super init];
     if (self) {
+        _path = CMHistoryPath();
         _items = [NSMutableArray array];
-        [self reloadFromDisk];
+        [self load];
+        NSLog(@"[CopyMody] History path: %@", _path);
     }
     return self;
 }
 
-- (void)reloadFromDisk {
-    NSArray *saved = [NSArray arrayWithContentsOfFile:kHistoryPath];
-    if (saved) {
-        _items = [saved mutableCopy];
+- (void)load {
+    NSData *data = [NSData dataWithContentsOfFile:_path];
+    if (!data) return;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([obj isKindOfClass:[NSArray class]]) {
+        _items = [obj mutableCopy];
+    }
+}
+
+- (void)save {
+    if (!_path) return;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:_items options:NSJSONWritingPrettyPrinted error:nil];
+    if (data) {
+        BOOL ok = [data writeToFile:_path atomically:YES];
+        NSLog(@"[CopyMody] save %@ → %@", ok ? @"OK" : @"FAIL", _path);
     }
 }
 
 - (NSArray<NSDictionary *> *)allItems {
-    [self reloadFromDisk]; // always fresh from disk (cross-process safe)
+    [self load]; // always reload from disk
     return [_items copy];
 }
 
 - (void)addText:(NSString *)text {
-    if (!text || text.length == 0) return;
-    // trim whitespace-only
+    if (!text) return;
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return;
+    // Limit extremely long pastes
+    if (trimmed.length > 10000) {
+        trimmed = [trimmed substringToIndex:10000];
+    }
 
-    [self reloadFromDisk];
+    [self load];
 
     if (_items.count > 0) {
         NSString *last = _items.firstObject[@"text"];
-        if ([last isEqualToString:text]) return;
+        if ([last isEqualToString:trimmed]) return;
     }
 
     NSDictionary *entry = @{
-        @"text"      : text,
-        @"timestamp" : @([[NSDate date] timeIntervalSince1970])
+        @"text"      : trimmed,
+        @"timestamp" : @((NSInteger)[[NSDate date] timeIntervalSince1970])
     };
-
     [_items insertObject:entry atIndex:0];
 
-    while (_items.count > kMaxHistoryItems) {
+    while ((NSInteger)_items.count > kMaxHistoryItems) {
         [_items removeLastObject];
     }
-
-    BOOL ok = [_items writeToFile:kHistoryPath atomically:YES];
-    if (!ok) {
-        // fallback: ensure parent exists then retry
-        NSString *dir = [kHistoryPath stringByDeletingLastPathComponent];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        [_items writeToFile:kHistoryPath atomically:YES];
-    }
+    [self save];
+    NSLog(@"[CopyMody] added: %@... (total %lu)", [trimmed substringToIndex:MIN(30, trimmed.length)], (unsigned long)_items.count);
 }
 
 - (void)removeItemAtIndex:(NSInteger)index {
-    [self reloadFromDisk];
+    [self load];
     if (index < 0 || index >= (NSInteger)_items.count) return;
     [_items removeObjectAtIndex:index];
-    [_items writeToFile:kHistoryPath atomically:YES];
+    [self save];
 }
 
 - (void)clearAll {
     [_items removeAllObjects];
-    [_items writeToFile:kHistoryPath atomically:YES];
+    [self save];
+}
+
+- (void)captureCurrentPasteboard {
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    // Prefer string
+    NSString *str = pb.string;
+    if (str.length > 0) {
+        [self addText:str];
+        return;
+    }
+    // Fallback: first string-like item
+    if (pb.numberOfItems > 0) {
+        NSArray *items = pb.items;
+        for (NSDictionary *item in items) {
+            for (id key in item) {
+                id val = item[key];
+                if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
+                    [self addText:val];
+                    return;
+                }
+                if ([val isKindOfClass:[NSData class]]) {
+                    NSString *decoded = [[NSString alloc] initWithData:val encoding:NSUTF8StringEncoding];
+                    if (decoded.length > 0) {
+                        [self addText:decoded];
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 @end
@@ -127,6 +196,9 @@ static UIWindow *CMKeyWindow(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+
+    // CRITICAL: capture whatever is currently in the pasteboard right when UI opens
+    [[CMHistoryManager shared] captureCurrentPasteboard];
 
     self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
 
@@ -188,6 +260,22 @@ static UIWindow *CMKeyWindow(void) {
 
     self.items = [[CMHistoryManager shared] allItems];
     [self.tableView reloadData];
+
+    // Empty state label
+    if (self.items.count == 0) {
+        UILabel *empty = [[UILabel alloc] init];
+        empty.text = @"لا يوجد عناصر بعد\nانسخ نصاً ثم افتح القائمة";
+        empty.textAlignment = NSTextAlignmentCenter;
+        empty.numberOfLines = 2;
+        empty.textColor = [UIColor secondaryLabelColor];
+        empty.font = [UIFont systemFontOfSize:15];
+        empty.translatesAutoresizingMaskIntoConstraints = NO;
+        [card addSubview:empty];
+        [NSLayoutConstraint activateConstraints:@[
+            [empty.centerXAnchor constraintEqualToAnchor:self.tableView.centerXAnchor],
+            [empty.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor]
+        ]];
+    }
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(closeTapped)];
     tap.cancelsTouchesInView = NO;
@@ -300,12 +388,9 @@ static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
 
 static void CMRemoveAllButtons(void) {
-    // Remove from every window to prevent duplicates
     for (UIWindow *w in CMAllWindows()) {
         for (UIView *v in [w.subviews copy]) {
-            if (v.tag == kButtonTag) {
-                [v removeFromSuperview];
-            }
+            if (v.tag == kButtonTag) [v removeFromSuperview];
         }
     }
     cmFloatButton = nil;
@@ -313,6 +398,9 @@ static void CMRemoveAllButtons(void) {
 
 static void CMPresentHistory(void) {
     if (cmOverlayWindow) return;
+
+    // Capture pasteboard BEFORE showing UI
+    [[CMHistoryManager shared] captureCurrentPasteboard];
 
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -342,18 +430,14 @@ static void CMShowFloatButton(CGRect keyboardFrame) {
     UIWindow *keyWindow = CMKeyWindow();
     if (!keyWindow) return;
 
-    // Always clean first → no duplicates
     CMRemoveAllButtons();
 
     CGFloat btnSize = 36.0;
     CGFloat pad = 6.0;
 
-    // Place INSIDE keyboard area – bottom-right corner
-    // (opposite side of the globe / language key which is usually bottom-left)
     CGFloat x = keyboardFrame.origin.x + keyboardFrame.size.width - btnSize - pad - 4;
     CGFloat y = keyboardFrame.origin.y + keyboardFrame.size.height - btnSize - pad - 4;
 
-    // Fallback if frame invalid
     if (keyboardFrame.size.height < 50) {
         x = keyWindow.bounds.size.width - btnSize - 12;
         y = keyWindow.bounds.size.height - 90;
@@ -368,7 +452,6 @@ static void CMShowFloatButton(CGRect keyboardFrame) {
     cmFloatButton.layer.shadowOpacity = 0.25;
     cmFloatButton.layer.shadowOffset = CGSizeMake(0, 1);
     cmFloatButton.layer.shadowRadius = 3;
-    cmFloatButton.clipsToBounds = NO;
 
     [cmFloatButton setTitle:@"📋" forState:UIControlStateNormal];
     cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:17];
@@ -385,15 +468,6 @@ static void CMHideFloatButton(void) {
     CMRemoveAllButtons();
 }
 
-// ==================== Clipboard capture ====================
-static void CMCapturePasteboard(void) {
-    UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    NSString *str = pb.string;
-    if (str.length > 0) {
-        [[CMHistoryManager shared] addText:str];
-    }
-}
-
 // ==================== Hooks ====================
 
 %hook UIPasteboard
@@ -408,22 +482,29 @@ static void CMCapturePasteboard(void) {
 - (void)setItems:(NSArray *)items {
     %orig;
     dispatch_async(dispatch_get_main_queue(), ^{
-        CMCapturePasteboard();
+        [[CMHistoryManager shared] captureCurrentPasteboard];
     });
+}
+
+- (void)setStrings:(NSArray<NSString *> *)strings {
+    %orig;
+    if (strings.count > 0 && [strings.firstObject length] > 0) {
+        [[CMHistoryManager shared] addText:strings.firstObject];
+    }
 }
 
 %end
 
 %ctor {
-    // ---- Clipboard change observer (most reliable) ----
+    // Pasteboard change notification
     [[NSNotificationCenter defaultCenter] addObserverForName:UIPasteboardChangedNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(__unused NSNotification *note) {
-        CMCapturePasteboard();
+        [[CMHistoryManager shared] captureCurrentPasteboard];
     }];
 
-    // ---- Keyboard show (single place only) ----
+    // Keyboard
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
@@ -436,7 +517,6 @@ static void CMCapturePasteboard(void) {
         CMShowFloatButton(kbFrame);
     }];
 
-    // ---- Keyboard hide (immediate) ----
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
@@ -451,5 +531,5 @@ static void CMCapturePasteboard(void) {
         CMHideFloatButton();
     }];
 
-    NSLog(@"[CopyMody] v0.1.2 loaded");
+    NSLog(@"[CopyMody] v0.1.3 loaded");
 }
