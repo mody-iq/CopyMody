@@ -2,10 +2,13 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-// ==================== Constants ====================
 static NSString * const kHistoryFileName = @"com.mody.copymody.history.json";
 static NSInteger const kMaxHistoryItems = 50;
 static NSInteger const kButtonTag = 88442211;
+
+static NSInteger cmLastChangeCount = -1;
+static BOOL cmIsCapturing = NO;
+static NSTimeInterval cmLastCaptureTime = 0;
 
 // ==================== Helpers ====================
 static NSArray<UIWindow *> *CMAllWindows(void) {
@@ -25,33 +28,18 @@ static UIWindow *CMKeyWindow(void) {
     return CMAllWindows().firstObject;
 }
 
-/// Returns a writable path that works under RootHide / normal jailbreaks
 static NSString *CMHistoryPath(void) {
-    // 1) Preferred: mobile Preferences
     NSString *pref = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@", kHistoryFileName];
-    // 2) Fallback: Library/CopyMody
     NSString *lib  = [NSString stringWithFormat:@"/var/mobile/Library/CopyMody/%@", kHistoryFileName];
-    // 3) Last resort: tmp (still better than nothing for testing)
-    NSString *tmp  = [NSTemporaryDirectory() stringByAppendingPathComponent:kHistoryFileName];
-
     NSFileManager *fm = [NSFileManager defaultManager];
-
-    // Ensure dirs exist
     [fm createDirectoryAtPath:[pref stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
     [fm createDirectoryAtPath:[lib  stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
-
-    // Prefer existing file location
     if ([fm fileExistsAtPath:pref]) return pref;
     if ([fm fileExistsAtPath:lib])  return lib;
-
-    // Try write test on pref
-    if ([@"[]" writeToFile:pref atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
-        return pref;
-    }
-    if ([@"[]" writeToFile:lib atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
-        return lib;
-    }
-    return tmp;
+    // try create pref
+    if ([@"[]" writeToFile:pref atomically:YES encoding:NSUTF8StringEncoding error:nil]) return pref;
+    if ([@"[]" writeToFile:lib  atomically:YES encoding:NSUTF8StringEncoding error:nil]) return lib;
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:kHistoryFileName];
 }
 
 // ==================== History Manager ====================
@@ -61,12 +49,13 @@ static NSString *CMHistoryPath(void) {
 - (void)addText:(NSString *)text;
 - (void)removeItemAtIndex:(NSInteger)index;
 - (void)clearAll;
-- (void)captureCurrentPasteboard;
+- (void)tryCaptureFromHook:(NSString *)string; // only from our hooks, safe
 @end
 
 @implementation CMHistoryManager {
     NSMutableArray<NSDictionary *> *_items;
     NSString *_path;
+    dispatch_queue_t _ioQueue;
 }
 
 + (instancetype)shared {
@@ -83,13 +72,14 @@ static NSString *CMHistoryPath(void) {
     if (self) {
         _path = CMHistoryPath();
         _items = [NSMutableArray array];
-        [self load];
-        NSLog(@"[CopyMody] History path: %@", _path);
+        _ioQueue = dispatch_queue_create("com.mody.copymody.io", DISPATCH_QUEUE_SERIAL);
+        [self loadSync];
+        NSLog(@"[CopyMody] path=%@", _path);
     }
     return self;
 }
 
-- (void)load {
+- (void)loadSync {
     NSData *data = [NSData dataWithContentsOfFile:_path];
     if (!data) return;
     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -98,17 +88,17 @@ static NSString *CMHistoryPath(void) {
     }
 }
 
-- (void)save {
-    if (!_path) return;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:_items options:NSJSONWritingPrettyPrinted error:nil];
-    if (data) {
-        BOOL ok = [data writeToFile:_path atomically:YES];
-        NSLog(@"[CopyMody] save %@ → %@", ok ? @"OK" : @"FAIL", _path);
-    }
+- (void)saveAsync {
+    NSArray *snapshot = [_items copy];
+    NSString *path = _path;
+    dispatch_async(_ioQueue, ^{
+        NSData *data = [NSJSONSerialization dataWithJSONObject:snapshot options:0 error:nil];
+        if (data) [data writeToFile:path atomically:YES];
+    });
 }
 
 - (NSArray<NSDictionary *> *)allItems {
-    [self load]; // always reload from disk
+    // Return in-memory copy only – never block UI with disk/pasteboard
     return [_items copy];
 }
 
@@ -116,71 +106,45 @@ static NSString *CMHistoryPath(void) {
     if (!text) return;
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return;
-    // Limit extremely long pastes
-    if (trimmed.length > 10000) {
-        trimmed = [trimmed substringToIndex:10000];
-    }
+    if (trimmed.length > 8000) trimmed = [trimmed substringToIndex:8000];
 
-    [self load];
-
+    // duplicate check
     if (_items.count > 0) {
         NSString *last = _items.firstObject[@"text"];
         if ([last isEqualToString:trimmed]) return;
     }
 
     NSDictionary *entry = @{
-        @"text"      : trimmed,
+        @"text" : trimmed,
         @"timestamp" : @((NSInteger)[[NSDate date] timeIntervalSince1970])
     };
     [_items insertObject:entry atIndex:0];
-
     while ((NSInteger)_items.count > kMaxHistoryItems) {
         [_items removeLastObject];
     }
-    [self save];
-    NSLog(@"[CopyMody] added: %@... (total %lu)", [trimmed substringToIndex:MIN(30, trimmed.length)], (unsigned long)_items.count);
+    [self saveAsync];
+}
+
+- (void)tryCaptureFromHook:(NSString *)string {
+    // Called only from our setString/setItems hooks – string already known, no pasteboard read
+    if (cmIsCapturing) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - cmLastCaptureTime < 0.35) return; // debounce
+    cmLastCaptureTime = now;
+    cmIsCapturing = YES;
+    [self addText:string];
+    cmIsCapturing = NO;
 }
 
 - (void)removeItemAtIndex:(NSInteger)index {
-    [self load];
     if (index < 0 || index >= (NSInteger)_items.count) return;
     [_items removeObjectAtIndex:index];
-    [self save];
+    [self saveAsync];
 }
 
 - (void)clearAll {
     [_items removeAllObjects];
-    [self save];
-}
-
-- (void)captureCurrentPasteboard {
-    UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    // Prefer string
-    NSString *str = pb.string;
-    if (str.length > 0) {
-        [self addText:str];
-        return;
-    }
-    // Fallback: first string-like item
-    if (pb.numberOfItems > 0) {
-        NSArray *items = pb.items;
-        for (NSDictionary *item in items) {
-            for (id key in item) {
-                id val = item[key];
-                if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
-                    [self addText:val];
-                    return;
-                }
-                if ([val isKindOfClass:[NSData class]]) {
-                    NSString *decoded = [[NSString alloc] initWithData:val encoding:NSUTF8StringEncoding];
-                    if (decoded.length > 0) {
-                        [self addText:decoded];
-                        return;
-                    }
-                }
-            }
-        }
-    }
+    [self saveAsync];
 }
 
 @end
@@ -189,6 +153,7 @@ static NSString *CMHistoryPath(void) {
 @interface CMHistoryViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<NSDictionary *> *items;
+@property (nonatomic, strong) UILabel *emptyLabel;
 @property (nonatomic, copy) void (^onDismiss)(void);
 @end
 
@@ -197,10 +162,7 @@ static NSString *CMHistoryPath(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    // CRITICAL: capture whatever is currently in the pasteboard right when UI opens
-    [[CMHistoryManager shared] captureCurrentPasteboard];
-
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
 
     UIView *card = [[UIView alloc] init];
     card.backgroundColor = [UIColor systemBackgroundColor];
@@ -233,15 +195,25 @@ static NSString *CMHistoryPath(void) {
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 60;
+    self.tableView.estimatedRowHeight = 56;
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.tableView];
+
+    self.emptyLabel = [[UILabel alloc] init];
+    self.emptyLabel.text = @"لا يوجد عناصر\nانسخ نصاً داخل هذا التطبيق";
+    self.emptyLabel.textAlignment = NSTextAlignmentCenter;
+    self.emptyLabel.numberOfLines = 2;
+    self.emptyLabel.textColor = [UIColor secondaryLabelColor];
+    self.emptyLabel.font = [UIFont systemFontOfSize:15];
+    self.emptyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.emptyLabel.hidden = YES;
+    [card addSubview:self.emptyLabel];
 
     [NSLayoutConstraint activateConstraints:@[
         [card.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
         [card.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
         [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-        [card.heightAnchor constraintEqualToConstant:420],
+        [card.heightAnchor constraintEqualToConstant:400],
 
         [titleLabel.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
         [titleLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
@@ -252,34 +224,22 @@ static NSString *CMHistoryPath(void) {
         [closeBtn.centerYAnchor constraintEqualToAnchor:titleLabel.centerYAnchor],
         [closeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
 
-        [self.tableView.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:12],
+        [self.tableView.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:10],
         [self.tableView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
         [self.tableView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
-        [self.tableView.bottomAnchor constraintEqualToAnchor:card.bottomAnchor]
+        [self.tableView.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
+
+        [self.emptyLabel.centerXAnchor constraintEqualToAnchor:self.tableView.centerXAnchor],
+        [self.emptyLabel.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor]
     ]];
 
+    [self reloadData];
+}
+
+- (void)reloadData {
     self.items = [[CMHistoryManager shared] allItems];
+    self.emptyLabel.hidden = (self.items.count > 0);
     [self.tableView reloadData];
-
-    // Empty state label
-    if (self.items.count == 0) {
-        UILabel *empty = [[UILabel alloc] init];
-        empty.text = @"لا يوجد عناصر بعد\nانسخ نصاً ثم افتح القائمة";
-        empty.textAlignment = NSTextAlignmentCenter;
-        empty.numberOfLines = 2;
-        empty.textColor = [UIColor secondaryLabelColor];
-        empty.font = [UIFont systemFontOfSize:15];
-        empty.translatesAutoresizingMaskIntoConstraints = NO;
-        [card addSubview:empty];
-        [NSLayoutConstraint activateConstraints:@[
-            [empty.centerXAnchor constraintEqualToAnchor:self.tableView.centerXAnchor],
-            [empty.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor]
-        ]];
-    }
-
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(closeTapped)];
-    tap.cancelsTouchesInView = NO;
-    [self.view addGestureRecognizer:tap];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -288,80 +248,63 @@ static NSString *CMHistoryPath(void) {
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"cell"];
-
     NSDictionary *item = self.items[indexPath.row];
     NSString *text = item[@"text"] ?: @"";
-
     cell.textLabel.numberOfLines = 3;
     cell.textLabel.font = [UIFont systemFontOfSize:15];
     cell.textLabel.text = text;
 
     NSTimeInterval ts = [item[@"timestamp"] doubleValue];
-    NSDate *date = [NSDate dateWithTimeIntervalSince1970:ts];
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateStyle = NSDateFormatterShortStyle;
     fmt.timeStyle = NSDateFormatterShortStyle;
-    cell.detailTextLabel.text = [fmt stringFromDate:date];
+    cell.detailTextLabel.text = [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]];
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-
     return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-
-    NSDictionary *item = self.items[indexPath.row];
-    NSString *text = item[@"text"];
+    NSString *text = self.items[indexPath.row][@"text"];
     if (!text) return;
 
+    // Set pasteboard (may trigger our hook – guarded by debounce)
     [[UIPasteboard generalPasteboard] setString:text];
 
     UIWindow *keyWindow = CMKeyWindow();
-    UIView *firstResponder = [self findFirstResponder:keyWindow];
-
-    if ([firstResponder respondsToSelector:@selector(paste:)]) {
-        [firstResponder paste:nil];
-    } else if ([firstResponder isKindOfClass:[UITextField class]]) {
-        [(UITextField *)firstResponder insertText:text];
-    } else if ([firstResponder isKindOfClass:[UITextView class]]) {
-        [(UITextView *)firstResponder insertText:text];
+    UIView *fr = [self findFirstResponder:keyWindow];
+    if ([fr isKindOfClass:[UITextField class]]) {
+        [(UITextField *)fr insertText:text];
+    } else if ([fr isKindOfClass:[UITextView class]]) {
+        [(UITextView *)fr insertText:text];
+    } else if ([fr respondsToSelector:@selector(paste:)]) {
+        [fr paste:nil];
     }
-
     [self closeTapped];
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
     trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-
-    UIContextualAction *deleteAction = [UIContextualAction
+    UIContextualAction *del = [UIContextualAction
         contextualActionWithStyle:UIContextualActionStyleDestructive
-                            title:@"حذف"
-                          handler:^(__unused UIContextualAction *action,
-                                    __unused UIView *sourceView,
-                                    void (^completionHandler)(BOOL)) {
-
-        [[CMHistoryManager shared] removeItemAtIndex:indexPath.row];
-        self.items = [[CMHistoryManager shared] allItems];
-        [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
-        completionHandler(YES);
-    }];
-
-    return [UISwipeActionsConfiguration configurationWithActions:@[deleteAction]];
+        title:@"حذف"
+        handler:^(__unused UIContextualAction *a, __unused UIView *v, void (^done)(BOOL)) {
+            [[CMHistoryManager shared] removeItemAtIndex:indexPath.row];
+            [self reloadData];
+            done(YES);
+        }];
+    return [UISwipeActionsConfiguration configurationWithActions:@[del]];
 }
 
 - (void)clearAllTapped {
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"مسح السجل"
-                         message:@"هل تريد حذف جميع العناصر؟"
-                  preferredStyle:UIAlertControllerStyleAlert];
-
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"مسح السجل"
+                                                                   message:@"حذف جميع العناصر؟"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"إلغاء" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"مسح" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
         [[CMHistoryManager shared] clearAll];
-        self.items = @[];
-        [self.tableView reloadData];
+        [self reloadData];
     }]];
-
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -375,15 +318,15 @@ static NSString *CMHistoryPath(void) {
     if (!view) return nil;
     if (view.isFirstResponder) return view;
     for (UIView *sub in view.subviews) {
-        UIView *found = [self findFirstResponder:sub];
-        if (found) return found;
+        UIView *f = [self findFirstResponder:sub];
+        if (f) return f;
     }
     return nil;
 }
 
 @end
 
-// ==================== Floating Button ====================
+// ==================== Button + Present ====================
 static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
 
@@ -399,9 +342,6 @@ static void CMRemoveAllButtons(void) {
 static void CMPresentHistory(void) {
     if (cmOverlayWindow) return;
 
-    // Capture pasteboard BEFORE showing UI
-    [[CMHistoryManager shared] captureCurrentPasteboard];
-
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if (s.activationState == UISceneActivationStateForegroundActive &&
@@ -413,31 +353,30 @@ static void CMPresentHistory(void) {
     if (!scene) return;
 
     cmOverlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
-    cmOverlayWindow.windowLevel = UIWindowLevelAlert + 100;
+    cmOverlayWindow.windowLevel = UIWindowLevelAlert + 50;
     cmOverlayWindow.backgroundColor = [UIColor clearColor];
+    cmOverlayWindow.userInteractionEnabled = YES;
 
     CMHistoryViewController *vc = [[CMHistoryViewController alloc] init];
     vc.onDismiss = ^{
         cmOverlayWindow.hidden = YES;
+        cmOverlayWindow.rootViewController = nil;
         cmOverlayWindow = nil;
     };
 
     cmOverlayWindow.rootViewController = vc;
-    cmOverlayWindow.hidden = NO;
+    [cmOverlayWindow makeKeyAndVisible];
 }
 
 static void CMShowFloatButton(CGRect keyboardFrame) {
     UIWindow *keyWindow = CMKeyWindow();
     if (!keyWindow) return;
-
     CMRemoveAllButtons();
 
     CGFloat btnSize = 36.0;
     CGFloat pad = 6.0;
-
     CGFloat x = keyboardFrame.origin.x + keyboardFrame.size.width - btnSize - pad - 4;
     CGFloat y = keyboardFrame.origin.y + keyboardFrame.size.height - btnSize - pad - 4;
-
     if (keyboardFrame.size.height < 50) {
         x = keyWindow.bounds.size.width - btnSize - 12;
         y = keyWindow.bounds.size.height - 90;
@@ -452,14 +391,11 @@ static void CMShowFloatButton(CGRect keyboardFrame) {
     cmFloatButton.layer.shadowOpacity = 0.25;
     cmFloatButton.layer.shadowOffset = CGSizeMake(0, 1);
     cmFloatButton.layer.shadowRadius = 3;
-
     [cmFloatButton setTitle:@"📋" forState:UIControlStateNormal];
     cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:17];
-
-    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+    [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) {
         CMPresentHistory();
     }] forControlEvents:UIControlEventTouchUpInside];
-
     cmFloatButton.layer.zPosition = 9999;
     [keyWindow addSubview:cmFloatButton];
 }
@@ -468,68 +404,71 @@ static void CMHideFloatButton(void) {
     CMRemoveAllButtons();
 }
 
-// ==================== Hooks ====================
+// ==================== Hooks (NO pasteboard .string reads) ====================
 
 %hook UIPasteboard
 
 - (void)setString:(NSString *)string {
     %orig;
-    if (string.length > 0) {
-        [[CMHistoryManager shared] addText:string];
+    if (string.length > 0 && !cmIsCapturing) {
+        [[CMHistoryManager shared] tryCaptureFromHook:string];
+    }
+}
+
+- (void)setStrings:(NSArray<NSString *> *)strings {
+    %orig;
+    if (strings.count > 0 && [strings.firstObject length] > 0 && !cmIsCapturing) {
+        [[CMHistoryManager shared] tryCaptureFromHook:strings.firstObject];
     }
 }
 
 - (void)setItems:(NSArray *)items {
     %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[CMHistoryManager shared] captureCurrentPasteboard];
-    });
-}
-
-- (void)setStrings:(NSArray<NSString *> *)strings {
-    %orig;
-    if (strings.count > 0 && [strings.firstObject length] > 0) {
-        [[CMHistoryManager shared] addText:strings.firstObject];
+    if (cmIsCapturing || items.count == 0) return;
+    // Extract string without calling pb.string (avoids privacy prompt / freeze)
+    for (NSDictionary *item in items) {
+        id val = item[@"public.utf8-plain-text"] ?: item[@"public.plain-text"] ?: item[@"public.text"];
+        if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
+            [[CMHistoryManager shared] tryCaptureFromHook:val];
+            return;
+        }
+        if ([val isKindOfClass:[NSData class]]) {
+            NSString *s = [[NSString alloc] initWithData:val encoding:NSUTF8StringEncoding];
+            if (s.length > 0) {
+                [[CMHistoryManager shared] tryCaptureFromHook:s];
+                return;
+            }
+        }
     }
 }
 
 %end
 
 %ctor {
-    // Pasteboard change notification
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIPasteboardChangedNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
-        [[CMHistoryManager shared] captureCurrentPasteboard];
-    }];
-
-    // Keyboard
+    // Keyboard only – no UIPasteboardChangedNotification (can cause freezes on iOS 18)
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
-        CGRect kbFrame = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
-        UIWindow *keyWindow = CMKeyWindow();
-        if (keyWindow) {
-            kbFrame = [keyWindow convertRect:kbFrame fromWindow:nil];
-        }
-        CMShowFloatButton(kbFrame);
+        CGRect kb = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+        UIWindow *kw = CMKeyWindow();
+        if (kw) kb = [kw convertRect:kb fromWindow:nil];
+        CMShowFloatButton(kb);
     }];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
+                                                  usingBlock:^(__unused NSNotification *n) {
         CMHideFloatButton();
     }];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidHideNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
+                                                  usingBlock:^(__unused NSNotification *n) {
         CMHideFloatButton();
     }];
 
-    NSLog(@"[CopyMody] v0.1.3 loaded");
+    NSLog(@"[CopyMody] v0.1.4 loaded (no blocking pasteboard reads)");
 }
