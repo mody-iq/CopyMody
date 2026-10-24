@@ -175,7 +175,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
         if (data) {
             for (NSString *path in CMHistoryPaths()) {
                 BOOL ok = [data writeToFile:path atomically:YES];
-                NSLog(@"[CopyMody] write %@ \u2192 %@", ok ? @"OK" : @"FAIL", path);
+                NSLog(@"[CopyMody] write %@ -> %@", ok ? @"OK" : @"FAIL", path);
             }
         }
         [defs setObject:snap forKey:kHistoryKey];
@@ -260,13 +260,13 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [card addSubview:title];
 
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [clearBtn setTitle:@"\u0645\u0633\u062d \u0627\u0644\u0643\u0644" forState:UIControlStateNormal];
+    [clearBtn setTitle:@"مسح الكل" forState:UIControlStateNormal];
     [clearBtn addTarget:self action:@selector(clearAll) forControlEvents:UIControlEventTouchUpInside];
     clearBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:clearBtn];
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [closeBtn setTitle:@"\u0625\u063a\u0644\u0627\u0642" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"إغلاق" forState:UIControlStateNormal];
     [closeBtn addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
     closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:closeBtn];
@@ -280,7 +280,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
     [card addSubview:self.tableView];
 
     self.emptyLabel = [[UILabel alloc] init];
-    self.emptyLabel.text = @"\u0644\u0627 \u064a\u0648\u062c\u062f \u0639\u0646\u0627\u0635\u0631\n\u0627\u0646\u0633\u062e \u0646\u0635\u0627\u064b \u062b\u0645 \u0627\u0636\u063a\u0637 \ud83d\udccb";
+    self.emptyLabel.text = @"لا يوجد عناصر\nانسخ نصاً ثم اضغط الزر";
     self.emptyLabel.textAlignment = NSTextAlignmentCenter;
     self.emptyLabel.numberOfLines = 2;
     self.emptyLabel.textColor = [UIColor secondaryLabelColor];
@@ -347,7 +347,7 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
-    UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"\u062d\u0630\u0641" handler:^(__unused UIContextualAction *a, __unused UIView *v, void (^done)(BOOL)) {
+    UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"حذف" handler:^(__unused UIContextualAction *a, __unused UIView *v, void (^done)(BOOL)) {
         [[CMHistoryManager shared] removeItemAtIndex:ip.row];
         [self reload];
         done(YES);
@@ -356,9 +356,9 @@ static NSArray<NSString *> *CMHistoryPaths(void) {
 }
 
 - (void)clearAll {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"\u0645\u0633\u062d \u0627\u0644\u0633\u062c\u0644" message:@"\u062d\u0630\u0641 \u0627\u0644\u0643\u0644\u061f" preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"\u0625\u0644\u063a\u0627\u0621" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"\u0645\u0633\u062d" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"مسح السجل" message:@"حذف الكل؟" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"إلغاء" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"مسح" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
         [[CMHistoryManager shared] clearAll];
         [self reload];
     }]];
@@ -432,8 +432,9 @@ static void CMShowButton(CGRect kb) {
     cmFloatButton.layer.shadowOpacity = 0.25;
     cmFloatButton.layer.shadowRadius = 3;
     cmFloatButton.layer.shadowOffset = CGSizeMake(0, 1);
-    [cmFloatButton setTitle:@"\ud83d\udccb" forState:UIControlStateNormal];
-    cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:17];
+    [cmFloatButton setTitle:@"CM" forState:UIControlStateNormal];
+    [cmFloatButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    cmFloatButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
     [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *a) { CMPresentHistory(); }] forControlEvents:UIControlEventTouchUpInside];
     [kw addSubview:cmFloatButton];
 }
