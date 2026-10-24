@@ -3,7 +3,12 @@
 		Bundles = (
 			"com.apple.UIKit",
 			"com.apple.springboard",
-			"com.apple.MobileNotes"
+			"com.apple.MobileNotes",
+			"com.apple.Preferences"
+		);
+		Executables = (
+			"MobileNotes",
+			"SpringBoard"
 		);
 	};
 }

@@ -1,6 +1,6 @@
 Package: com.mody.copymody
 Name: CopyMody
-Version: 0.1.7
+Version: 0.1.8
 Architecture: iphoneos-arm64e
 Description: Clipboard Manager Tweak for RootHide / iOS 18.7
 Maintainer: Mody
