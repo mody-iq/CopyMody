@@ -2,7 +2,8 @@
 	Filter = {
 		Bundles = (
 			"com.apple.UIKit",
-			"com.apple.springboard"
+			"com.apple.springboard",
+			"com.apple.MobileNotes"
 		);
 	};
 }
