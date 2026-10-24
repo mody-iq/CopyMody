@@ -3,8 +3,9 @@
 #import <objc/runtime.h>
 
 // ==================== Constants ====================
-static NSString * const kHistoryPath = @"/var/mobile/Library/CopyMody/history.plist";
+static NSString * const kHistoryPath = @"/var/mobile/Library/Preferences/com.mody.copymody.history.plist";
 static NSInteger const kMaxHistoryItems = 50;
+static NSInteger const kButtonTag = 88442211;
 
 // ==================== Helpers ====================
 static NSArray<UIWindow *> *CMAllWindows(void) {
@@ -28,10 +29,10 @@ static UIWindow *CMKeyWindow(void) {
 @interface CMHistoryManager : NSObject
 + (instancetype)shared;
 - (NSArray<NSDictionary *> *)allItems;
+- (void)reloadFromDisk;
 - (void)addText:(NSString *)text;
 - (void)removeItemAtIndex:(NSInteger)index;
 - (void)clearAll;
-- (void)save;
 @end
 
 @implementation CMHistoryManager {
@@ -50,24 +51,31 @@ static UIWindow *CMKeyWindow(void) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        NSString *dir = [kHistoryPath stringByDeletingLastPathComponent];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:nil];
-
-        NSArray *saved = [NSArray arrayWithContentsOfFile:kHistoryPath];
-        _items = saved ? [saved mutableCopy] : [NSMutableArray array];
+        _items = [NSMutableArray array];
+        [self reloadFromDisk];
     }
     return self;
 }
 
+- (void)reloadFromDisk {
+    NSArray *saved = [NSArray arrayWithContentsOfFile:kHistoryPath];
+    if (saved) {
+        _items = [saved mutableCopy];
+    }
+}
+
 - (NSArray<NSDictionary *> *)allItems {
+    [self reloadFromDisk]; // always fresh from disk (cross-process safe)
     return [_items copy];
 }
 
 - (void)addText:(NSString *)text {
     if (!text || text.length == 0) return;
+    // trim whitespace-only
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return;
+
+    [self reloadFromDisk];
 
     if (_items.count > 0) {
         NSString *last = _items.firstObject[@"text"];
@@ -85,21 +93,24 @@ static UIWindow *CMKeyWindow(void) {
         [_items removeLastObject];
     }
 
-    [self save];
+    BOOL ok = [_items writeToFile:kHistoryPath atomically:YES];
+    if (!ok) {
+        // fallback: ensure parent exists then retry
+        NSString *dir = [kHistoryPath stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [_items writeToFile:kHistoryPath atomically:YES];
+    }
 }
 
 - (void)removeItemAtIndex:(NSInteger)index {
+    [self reloadFromDisk];
     if (index < 0 || index >= (NSInteger)_items.count) return;
     [_items removeObjectAtIndex:index];
-    [self save];
+    [_items writeToFile:kHistoryPath atomically:YES];
 }
 
 - (void)clearAll {
     [_items removeAllObjects];
-    [self save];
-}
-
-- (void)save {
     [_items writeToFile:kHistoryPath atomically:YES];
 }
 
@@ -152,7 +163,6 @@ static UIWindow *CMKeyWindow(void) {
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 60;
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.tableView registerClass:[UITableViewCell class] forCellReuseIdentifier:@"cell"];
     [card addSubview:self.tableView];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -285,10 +295,21 @@ static UIWindow *CMKeyWindow(void) {
 
 @end
 
-// ==================== Floating Button + History Presenter ====================
+// ==================== Floating Button ====================
 static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
-static UIWindow *cmButtonHostWindow = nil;
+
+static void CMRemoveAllButtons(void) {
+    // Remove from every window to prevent duplicates
+    for (UIWindow *w in CMAllWindows()) {
+        for (UIView *v in [w.subviews copy]) {
+            if (v.tag == kButtonTag) {
+                [v removeFromSuperview];
+            }
+        }
+    }
+    cmFloatButton = nil;
+}
 
 static void CMPresentHistory(void) {
     if (cmOverlayWindow) return;
@@ -321,55 +342,56 @@ static void CMShowFloatButton(CGRect keyboardFrame) {
     UIWindow *keyWindow = CMKeyWindow();
     if (!keyWindow) return;
 
-    // Remove previous button if any
-    if (cmFloatButton) {
-        [cmFloatButton removeFromSuperview];
-        cmFloatButton = nil;
-    }
+    // Always clean first → no duplicates
+    CMRemoveAllButtons();
 
-    CGFloat btnSize = 40.0;
-    CGFloat margin = 10.0;
+    CGFloat btnSize = 36.0;
+    CGFloat pad = 6.0;
 
-    // Position: bottom-right, just above the keyboard
-    // keyboardFrame is in screen coordinates
-    CGFloat x = keyWindow.bounds.size.width - btnSize - margin - 6;
-    CGFloat y = keyboardFrame.origin.y - btnSize - margin;
+    // Place INSIDE keyboard area – bottom-right corner
+    // (opposite side of the globe / language key which is usually bottom-left)
+    CGFloat x = keyboardFrame.origin.x + keyboardFrame.size.width - btnSize - pad - 4;
+    CGFloat y = keyboardFrame.origin.y + keyboardFrame.size.height - btnSize - pad - 4;
 
-    // Safety: if keyboard frame is zero or invalid, place near bottom
-    if (keyboardFrame.size.height < 10 || y < 40) {
-        y = keyWindow.bounds.size.height - 320 - btnSize;
+    // Fallback if frame invalid
+    if (keyboardFrame.size.height < 50) {
+        x = keyWindow.bounds.size.width - btnSize - 12;
+        y = keyWindow.bounds.size.height - 90;
     }
 
     cmFloatButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    cmFloatButton.tag = kButtonTag;
     cmFloatButton.frame = CGRectMake(x, y, btnSize, btnSize);
-    cmFloatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.45 blue:0.95 alpha:0.95];
+    cmFloatButton.backgroundColor = [UIColor colorWithRed:0.18 green:0.42 blue:0.92 alpha:0.92];
     cmFloatButton.layer.cornerRadius = btnSize / 2.0;
     cmFloatButton.layer.shadowColor = [UIColor blackColor].CGColor;
-    cmFloatButton.layer.shadowOpacity = 0.3;
-    cmFloatButton.layer.shadowOffset = CGSizeMake(0, 2);
-    cmFloatButton.layer.shadowRadius = 4;
+    cmFloatButton.layer.shadowOpacity = 0.25;
+    cmFloatButton.layer.shadowOffset = CGSizeMake(0, 1);
+    cmFloatButton.layer.shadowRadius = 3;
     cmFloatButton.clipsToBounds = NO;
 
     [cmFloatButton setTitle:@"📋" forState:UIControlStateNormal];
-    cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:20];
+    cmFloatButton.titleLabel.font = [UIFont systemFontOfSize:17];
 
     [cmFloatButton addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
         CMPresentHistory();
     }] forControlEvents:UIControlEventTouchUpInside];
 
-    // Keep it above most content but below alerts
     cmFloatButton.layer.zPosition = 9999;
-
     [keyWindow addSubview:cmFloatButton];
-    cmButtonHostWindow = keyWindow;
 }
 
 static void CMHideFloatButton(void) {
-    if (cmFloatButton) {
-        [cmFloatButton removeFromSuperview];
-        cmFloatButton = nil;
+    CMRemoveAllButtons();
+}
+
+// ==================== Clipboard capture ====================
+static void CMCapturePasteboard(void) {
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    NSString *str = pb.string;
+    if (str.length > 0) {
+        [[CMHistoryManager shared] addText:str];
     }
-    cmButtonHostWindow = nil;
 }
 
 // ==================== Hooks ====================
@@ -385,57 +407,36 @@ static void CMHideFloatButton(void) {
 
 - (void)setItems:(NSArray *)items {
     %orig;
-    for (NSDictionary *item in items) {
-        id str = item[@"public.utf8-plain-text"] ?: item[@"public.plain-text"] ?: item[@"public.text"];
-        if ([str isKindOfClass:[NSString class]] && [(NSString *)str length] > 0) {
-            [[CMHistoryManager shared] addText:(NSString *)str];
-            break;
-        }
-        if ([str isKindOfClass:[NSData class]]) {
-            NSString *decoded = [[NSString alloc] initWithData:(NSData *)str encoding:NSUTF8StringEncoding];
-            if (decoded.length > 0) {
-                [[CMHistoryManager shared] addText:decoded];
-                break;
-            }
-        }
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CMCapturePasteboard();
+    });
 }
 
 %end
 
 %ctor {
-    // Show button when keyboard appears – use frame from notification (most reliable)
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillShowNotification
+    // ---- Clipboard change observer (most reliable) ----
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIPasteboardChangedNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *note) {
-        NSDictionary *info = note.userInfo;
-        CGRect kbFrame = [info[UIKeyboardFrameEndUserInfoKey] CGRectValue];
-
-        // Convert to key window coordinates if needed
-        UIWindow *keyWindow = CMKeyWindow();
-        if (keyWindow) {
-            kbFrame = [keyWindow convertRect:kbFrame fromWindow:nil];
-        }
-
-        CMShowFloatButton(kbFrame);
+                                                  usingBlock:^(__unused NSNotification *note) {
+        CMCapturePasteboard();
     }];
 
+    // ---- Keyboard show (single place only) ----
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
-        NSDictionary *info = note.userInfo;
-        CGRect kbFrame = [info[UIKeyboardFrameEndUserInfoKey] CGRectValue];
-
+        CGRect kbFrame = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
         UIWindow *keyWindow = CMKeyWindow();
         if (keyWindow) {
             kbFrame = [keyWindow convertRect:kbFrame fromWindow:nil];
         }
-
         CMShowFloatButton(kbFrame);
     }];
 
+    // ---- Keyboard hide (immediate) ----
     [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardWillHideNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
@@ -450,5 +451,5 @@ static void CMHideFloatButton(void) {
         CMHideFloatButton();
     }];
 
-    NSLog(@"[CopyMody] Loaded – floating button + clipboard monitor ready");
+    NSLog(@"[CopyMody] v0.1.2 loaded");
 }
