@@ -15,6 +15,17 @@ static CGFloat cmKeyboardHeight = 0;
 static UIWindow *cmOverlayWindow = nil;
 static UIButton *cmFloatButton = nil;
 static __weak UIView *cmSavedFirstResponder = nil;
+static NSInteger cmHookHits = 0;
+static NSInteger cmNotifHits = 0;
+static NSInteger cmCaptureCount = 0;
+static NSString *cmLastInfo = @"-";
+static NSString *cmPBClassName = @"?";
+static NSTimeInterval cmLastActive = 0;
+
+static NSString *CMDiagString(void) {
+    return [NSString stringWithFormat:@"v0.1.13 | h%ld n%ld c%ld | %@ | %@",
+            (long)cmHookHits, (long)cmNotifHits, (long)cmCaptureCount, cmLastInfo, cmPBClassName];
+}
 
 #pragma mark - Windows and responders
 
@@ -290,20 +301,57 @@ static NSInteger CMGeneralChangeCount(void) {
     return [UIPasteboard generalPasteboard].changeCount;
 }
 
+static NSString *CMStringFromPasteboard(UIPasteboard *pb) {
+    NSString *s = pb.string;
+    if (s.length > 0) return s;
+    NSArray<NSString *> *types = @[@"public.utf8-plain-text", @"public.plain-text", @"public.text"];
+    for (NSString *type in types) {
+        id v = [pb valueForPasteboardType:type];
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) return (NSString *)v;
+        if ([v isKindOfClass:[NSData class]]) {
+            NSString *t = [[NSString alloc] initWithData:(NSData *)v encoding:NSUTF8StringEncoding];
+            if (t.length > 0) return t;
+        }
+    }
+    return nil;
+}
+
 static void CMCaptureAfterChange(NSInteger before) {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
     NSInteger cc = pb.changeCount;
-    if (cc == before || cc == cmLastCaptured || cc == cmOwnChangeCount) return;
+    if (cc == before) { cmLastInfo = @"same-count"; return; }
+    if (cc == cmLastCaptured) { cmLastInfo = @"dup"; return; }
+    if (cc == cmOwnChangeCount) { cmLastInfo = @"own"; return; }
     cmLastCaptured = cc;
-    if (!pb.hasStrings) return;
-    NSString *s = pb.string;
-    if (s.length > 0) [[CMHistoryManager shared] addText:s];
+    NSString *s = CMStringFromPasteboard(pb);
+    if (s.length == 0) { cmLastInfo = @"no-text"; return; }
+    cmCaptureCount++;
+    cmLastInfo = @"saved";
+    [[CMHistoryManager shared] addText:s];
 }
 
 static void CMScheduleCapture(NSInteger before) {
+    cmHookHits++;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         CMCaptureAfterChange(before);
+    });
+}
+
+// Fallback that does not depend on any hook: UIKit tells us the pasteboard changed.
+static void CMHandlePasteboardNotification(void) {
+    cmNotifHits++;
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - cmLastActive < 1.0) {
+        // Change that happened while we were in the background: never read it (paste prompt)
+        cmLastCaptured = CMGeneralChangeCount();
+        cmLastInfo = @"skip-activation";
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CMCaptureAfterChange(-1);
     });
 }
 
@@ -313,6 +361,7 @@ static void CMScheduleCapture(NSInteger before) {
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<NSDictionary *> *items;
 @property (nonatomic, strong) UILabel *emptyLabel;
+@property (nonatomic, strong) UILabel *diagLabel;
 @property (nonatomic, copy) void (^onClose)(void);
 @end
 
@@ -359,6 +408,13 @@ static void CMScheduleCapture(NSInteger before) {
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.tableView];
+
+    self.diagLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 300, 44)];
+    self.diagLabel.textAlignment = NSTextAlignmentCenter;
+    self.diagLabel.numberOfLines = 2;
+    self.diagLabel.textColor = [UIColor tertiaryLabelColor];
+    self.diagLabel.font = [UIFont systemFontOfSize:10];
+    self.tableView.tableFooterView = self.diagLabel;
 
     self.emptyLabel = [[UILabel alloc] init];
     self.emptyLabel.text = @"لا يوجد عناصر\nانسخ نصاً ثم افتح القائمة";
@@ -415,6 +471,7 @@ static void CMScheduleCapture(NSInteger before) {
 - (void)reload {
     self.items = [[CMHistoryManager shared] allItems];
     self.emptyLabel.hidden = self.items.count > 0;
+    self.diagLabel.text = CMDiagString();
     [self.tableView reloadData];
 }
 
@@ -642,6 +699,86 @@ static void CMShowButton(CGRect kb) {
 
 %end
 
+%group CMConcrete
+
+%hook CMConcretePB
+
+- (void)setString:(NSString *)string {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setStrings:(NSArray *)strings {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setItems:(NSArray *)items {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setItems:(NSArray *)items options:(NSDictionary *)options {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)addItems:(NSArray *)items {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setValue:(id)value forPasteboardType:(NSString *)pasteboardType {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setData:(NSData *)data forPasteboardType:(NSString *)pasteboardType {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setItemProviders:(NSArray *)itemProviders localOnly:(BOOL)localOnly expirationDate:(NSDate *)expirationDate {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setObjects:(NSArray *)objects {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+- (void)setObjects:(NSArray *)objects localOnly:(BOOL)localOnly expirationDate:(NSDate *)expirationDate {
+    NSInteger before = CMGeneralChangeCount();
+    %orig;
+    CMScheduleCapture(before);
+}
+
+%end
+
+%end
+
+%hook UIApplication
+
+- (BOOL)sendAction:(SEL)action to:(id)target from:(id)sender forEvent:(UIEvent *)event {
+    BOOL isCopy = (action == @selector(copy:) || action == @selector(cut:));
+    NSInteger before = isCopy ? CMGeneralChangeCount() : 0;
+    BOOL result = %orig;
+    if (isCopy) CMScheduleCapture(before);
+    return result;
+}
+
+%end
+
 %ctor {
     @autoreleasepool {
         // Never load twice in the same process
@@ -653,7 +790,32 @@ static void CMShowButton(CGRect kb) {
         if ([mb.bundleIdentifier isEqualToString:@"com.apple.springboard"]) return;
         setenv("COPYMODY_LOADED", "1", 1);
 
+        cmLastActive = [NSDate timeIntervalSinceReferenceDate];
+
         %init;
+
+        // Also hook the concrete pasteboard class if UIKit uses a private subclass
+        Class concretePB = object_getClass([UIPasteboard generalPasteboard]);
+        if (concretePB) {
+            cmPBClassName = NSStringFromClass(concretePB);
+            if (concretePB != [UIPasteboard class]) {
+                %init(CMConcrete, CMConcretePB = concretePB);
+            }
+        }
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIPasteboardChangedNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *n) {
+            CMHandlePasteboardNotification();
+        }];
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *n) {
+            cmLastActive = [NSDate timeIntervalSinceReferenceDate];
+        }];
 
         [[NSNotificationCenter defaultCenter] addObserverForName:UIKeyboardDidShowNotification
                                                           object:nil
@@ -675,6 +837,6 @@ static void CMShowButton(CGRect kb) {
             if (!cmOverlayWindow) CMRemoveButtons();
         }];
 
-        NSLog(@"[CopyMody] v0.1.12 loaded");
+        NSLog(@"[CopyMody] v0.1.13 loaded");
     }
 }
